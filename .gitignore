@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Local config and secrets
+.env
+config.ini
+
+# Logs and outputs (may contain PII)
+email_analyzer.log
+email_analysis_output/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/

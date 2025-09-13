@@ -1,0 +1,50 @@
+[
+  {
+    "uid": "1",
+    "subject": "Big Sale this weekend",
+    "sender": "promo@shop.example.com",
+    "date": "2025-09-10T15:29:07.444263",
+    "category": "promotional",
+    "importance_score": 0.1
+  },
+  {
+    "uid": "2",
+    "subject": "Project update",
+    "sender": "alice@company.com",
+    "date": "2025-09-12T10:29:07.444263",
+    "category": "work",
+    "importance_score": 0.30000000000000004
+  },
+  {
+    "uid": "3",
+    "subject": "Family reunion",
+    "sender": "mom@example.com",
+    "date": "2025-08-13T15:29:07.444263",
+    "category": "personal",
+    "importance_score": 0.0
+  },
+  {
+    "uid": "4",
+    "subject": "Weekly Newsletter",
+    "sender": "news@newsletter.com",
+    "date": "2025-09-11T15:29:07.444263",
+    "category": "newsletter",
+    "importance_score": 0.2
+  },
+  {
+    "uid": "5",
+    "subject": "You are a winner!",
+    "sender": "scam@spam.com",
+    "date": "2025-06-04T15:29:07.444263",
+    "category": "spam",
+    "importance_score": 0.0
+  },
+  {
+    "uid": "6",
+    "subject": "Immediate: Action required",
+    "sender": "boss@company.com",
+    "date": "2025-09-12T13:29:07.444263",
+    "category": "spam",
+    "importance_score": 0.7
+  }
+]

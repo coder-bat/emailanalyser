@@ -196,8 +196,6 @@ python3 main.py
 
 ---
 
-Generated: 2025-09-12
-
 ## Quick start
 
 1. Create a virtual environment (recommended):
@@ -279,7 +277,7 @@ Common useful queries:
 - `SINCE 01-Jan-2025` — messages since a date (IMAP date format). Combine with categories if you want recent category-scoped messages.
 - `X-GM-RAW "category:promotions UNSEEN"` — Gmail-only: unseen promotions.
 
-If you need more advanced filtering (attachments, specific senders), you can set `EMAIL_SEARCH_CRITERIA` environment variable to any IMAP-search expression or extend `main.py` to accept a `--query` parameter (I can add that if you want).
+If you need more advanced filtering (attachments, specific senders), you can set `EMAIL_SEARCH_CRITERIA` environment variable to any IMAP-search expression or extend `main.py` to accept a `--query` parameter.
 
 ## Security and credentials
 
@@ -299,25 +297,7 @@ If you need more advanced filtering (attachments, specific senders), you can set
 - Add OAuth2 support for Gmail to avoid app-specific passwords.
 - Add unit tests that mock IMAP server responses to validate category behavior without a real account.
 
-If you want, I can patch the README with specific examples for your account or add the `--query` CLI option now.
-
 ---
-Generated on 2025-09-12
-
-## Examples tailored for you
-
-Below are example commands using the account `harekrsna.viral@gmail.com` (replace with your own when necessary). These are safe examples — do not paste passwords into the shell; instead use the prompt or environment variables.
-
-```bash
-# Analyze up to 10 unread messages in Promotions (quick triage)
-python3 main.py --email "harekrsna.viral@gmail.com" --server "imap.gmail.com" --max-emails 10 --unread --gmail-categories Promotions
-
-# Analyze Primary + Social, using a combined X-GM-RAW query (default behavior)
-python3 main.py --email "harekrsna.viral@gmail.com" --server "imap.gmail.com" --max-emails 100 --gmail-categories Primary,Social
-
-# Force per-category searches instead of combined (set GMAIL_COMBINED=0)
-GMAIL_COMBINED=0 python3 main.py --email "harekrsna.viral@gmail.com" --max-emails 100 --gmail-categories Promotions,Social
-```
 
 ### Configurable combined-search behavior
 
@@ -355,4 +335,4 @@ python3 main.py --email "you@example.com" --server "imap.gmail.com" --max-emails
 
 Notes:
 - For Gmail, create an app password and enable IMAP in your account settings.
-- `main.py` may require small refactors before running against a real inbox — open an issue or ask for help and I can make it runnable end-to-end.
+- `main.py` may require small refactors before running against a real inbox — open an issue or ask for help

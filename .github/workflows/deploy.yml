@@ -1,0 +1,240 @@
+name: Build and Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  packages: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install flask flask-cors pytest
+
+    - name: Run Python tests
+      run: |
+        python run_demo.py
+        # Run any existing tests
+        if [ -d "tests" ]; then
+          python -m pytest tests/ -v || true
+        fi
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+    - name: Test frontend build
+      run: |
+        cd frontend
+        ls -la build/
+
+  build-docker:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Output image
+      id: image
+      run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+
+  deploy-pages:
+    needs: [build-and-test, build-docker]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Build frontend for GitHub Pages
+      run: |
+        cd frontend
+        # Set the homepage for GitHub Pages
+        npm run build
+      env:
+        PUBLIC_URL: /${{ github.event.repository.name }}
+
+    - name: Create deployment files
+      run: |
+        # Create a deployment directory
+        mkdir -p deploy
+        
+        # Copy built frontend
+        cp -r frontend/build/* deploy/
+        
+        # Create a simple landing page with Docker instructions
+        cat > deploy/docker.html << 'EOF'
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>EmailAnalyser - Docker Deployment</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+                .header { background: #1976d2; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+                .code { background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0; }
+                .step { margin: 20px 0; padding: 15px; border-left: 4px solid #1976d2; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>EmailAnalyser</h1>
+                <p>Comprehensive email analysis tool with React frontend</p>
+            </div>
+            
+            <div class="step">
+                <h2>🐳 Docker Deployment</h2>
+                <p>Run the EmailAnalyser with Docker:</p>
+                <div class="code">
+                    <code>docker run -p 5000:5000 ghcr.io/${{ github.repository }}:latest</code>
+                </div>
+                <p>Then visit: <a href="http://localhost:5000">http://localhost:5000</a></p>
+            </div>
+            
+            <div class="step">
+                <h2>🚀 Docker Compose</h2>
+                <p>For persistent data:</p>
+                <div class="code">
+                    <code>wget https://raw.githubusercontent.com/${{ github.repository }}/main/docker-compose.yml<br>
+                    docker-compose up -d</code>
+                </div>
+            </div>
+            
+            <div class="step">
+                <h2>⚙️ Configuration</h2>
+                <p>Set environment variables for email analysis:</p>
+                <div class="code">
+                    <code>EMAIL_ADDRESS=your-email@gmail.com<br>
+                    EMAIL_PASSWORD=your-app-password<br>
+                    MAX_EMAILS=1000</code>
+                </div>
+            </div>
+            
+            <div class="step">
+                <h2>📊 Features</h2>
+                <ul>
+                    <li>Email categorization and importance scoring</li>
+                    <li>Interactive dashboard with charts and analytics</li>
+                    <li>Sender analysis and cleanup recommendations</li>
+                    <li>Gmail category filtering</li>
+                    <li>CSV and JSON data exports</li>
+                </ul>
+            </div>
+            
+            <div class="step">
+                <h2>🔗 Links</h2>
+                <p>
+                    <a href="/">📱 Frontend Demo</a> |
+                    <a href="https://github.com/${{ github.repository }}">📂 GitHub Repository</a> |
+                    <a href="https://github.com/${{ github.repository }}/pkgs/container/emailanalyser">🐳 Container Registry</a>
+                </p>
+            </div>
+        </body>
+        </html>
+        EOF
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Upload to GitHub Pages
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: './deploy'
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

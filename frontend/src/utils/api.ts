@@ -1,0 +1,72 @@
+import axios from 'axios';
+import { EmailMessage, SenderStats, ActionableSender, AnalysisPatterns, AnalysisSummary } from '../types';
+
+// Prefer relative URLs so the frontend served by Flask can call backend without CORS issues.
+// Allow override via REACT_APP_API_BASE_URL (or legacy REACT_APP_API_URL).
+const API_BASE_URL =
+  process.env.REACT_APP_API_BASE_URL ||
+  process.env.REACT_APP_API_URL ||
+  '';
+
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+});
+
+export const emailAnalysisApi = {
+  // Get analysis summary
+  getSummary: async (): Promise<AnalysisSummary> => {
+    const response = await api.get('/api/summary');
+    return response.data;
+  },
+
+  // Get email data
+  getEmails: async (limit?: number): Promise<EmailMessage[]> => {
+    const response = await api.get('/api/emails', { params: { limit } });
+    return response.data;
+  },
+
+  // Get sender statistics
+  getSenderStats: async (): Promise<SenderStats[]> => {
+    const response = await api.get('/api/sender-stats');
+    return response.data;
+  },
+
+  // Get senders to delete
+  getSendersToDelete: async (): Promise<ActionableSender[]> => {
+    const response = await api.get('/api/senders-to-delete');
+    return response.data;
+  },
+
+  // Get important senders
+  getImportantSenders: async (): Promise<ActionableSender[]> => {
+    const response = await api.get('/api/important-senders');
+    return response.data;
+  },
+
+  // Get analysis patterns
+  getPatterns: async (): Promise<AnalysisPatterns> => {
+    const response = await api.get('/api/patterns');
+    return response.data;
+  },
+
+  // Run email analysis
+  runAnalysis: async (config: {
+    email?: string;
+    max_emails?: number;
+    categories?: string;
+    unread_only?: boolean;
+    password?: string; // optional password/app password
+  }): Promise<{ message: string; job_id?: string }> => {
+    const response = await api.post('/api/run-analysis', config);
+    return response.data;
+  },
+
+  // Get analysis status
+  getAnalysisStatus: async (jobId: string): Promise<{ status: string; progress?: number; error?: string }> => {
+    const response = await api.get(`/api/analysis-status/${jobId}`);
+    return response.data;
+  },
+};
+
+export default emailAnalysisApi;

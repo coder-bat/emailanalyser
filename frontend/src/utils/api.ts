@@ -56,6 +56,7 @@ export const emailAnalysisApi = {
     max_emails?: number;
     categories?: string;
     unread_only?: boolean;
+    password?: string; // optional password/app password
   }): Promise<{ message: string; job_id?: string }> => {
     const response = await api.post('/api/run-analysis', config);
     return response.data;

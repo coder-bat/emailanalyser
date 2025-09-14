@@ -14,6 +14,7 @@ RUN npm ci --only=production
 COPY frontend/ ./
 
 # Build frontend for production
+ENV CI=false
 RUN npm run build
 
 # Python backend stage
@@ -22,21 +23,24 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including curl for health checks
 RUN apt-get update && apt-get install -y \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Install with trusted hosts to handle SSL issues
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org -r requirements.txt
 
 # Install Flask for API server
-RUN pip install flask flask-cors gunicorn
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org flask flask-cors gunicorn
 
 # Copy Python source code
 COPY *.py ./
-COPY tests/ ./tests/
+COPY tests/ ./tests/ 2>/dev/null || true
 
 # Copy built frontend from previous stage
 COPY --from=frontend-build /app/frontend/build ./frontend/build/

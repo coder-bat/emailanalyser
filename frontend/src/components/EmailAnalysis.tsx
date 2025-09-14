@@ -72,7 +72,7 @@ const EmailAnalysis: React.FC = () => {
   });
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<{status:string; progress:number; error?:string} | null>(null);
-  const [jobPolling, setJobPolling] = useState<NodeJS.Timeout | null>(null);
+  const jobPollingRef = React.useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -149,7 +149,7 @@ const EmailAnalysis: React.FC = () => {
             setJobStatus({ status: s.status, progress: s.progress || 0, error: s.error });
             if (s.status === 'completed' || s.status === 'failed') {
               clearInterval(interval);
-              setJobPolling(null);
+              jobPollingRef.current = null;
               // Refresh displayed data if success
               if (s.status === 'completed') {
                 try {
@@ -170,15 +170,25 @@ const EmailAnalysis: React.FC = () => {
             }
           } catch (e) {
             clearInterval(interval);
-            setJobPolling(null);
+            jobPollingRef.current = null;
           }
         }, 3000);
-        setJobPolling(interval as unknown as NodeJS.Timeout);
+        jobPollingRef.current = interval as unknown as NodeJS.Timeout;
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run analysis');
     }
   };
+
+  // Cleanup polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (jobPollingRef.current) {
+        clearInterval(jobPollingRef.current);
+        jobPollingRef.current = null;
+      }
+    };
+  }, []);
 
   if (loading) {
     return (

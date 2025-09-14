@@ -7,20 +7,106 @@ import os
 import json
 import csv
 from datetime import datetime
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, abort, send_file
 from flask_cors import CORS
 import logging
+import threading
+import subprocess
+import uuid
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for React frontend
+_frontend_build_dir = os.path.join(os.path.dirname(__file__), 'frontend', 'build')
+app = Flask(
+    __name__,
+    static_folder=_frontend_build_dir,
+    static_url_path=''  # so /static maps to build/static automatically
+)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable broad CORS for API endpoints
 
 # Configuration
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'email_analysis_output')
 API_PORT = int(os.environ.get('API_PORT', 5000))
+
+# In-memory job tracking
+jobs_lock = threading.Lock()
+jobs = {}
+
+def _run_analysis_job(job_id: str, params: dict):
+    """Worker thread to execute main.py analysis and update job status."""
+    with jobs_lock:
+        jobs[job_id]['status'] = 'running'
+        jobs[job_id]['progress'] = 5
+    env = os.environ.copy()
+    # Pass selected params as env vars understood by main.py
+    if params.get('email'):
+        env['EMAIL_ADDRESS'] = params['email']
+    if params.get('max_emails'):
+        env['MAX_EMAILS'] = str(params['max_emails'])
+    if params.get('categories'):
+        env['GMAIL_CATEGORIES'] = params['categories']
+    if params.get('unread_only'):
+        env['EMAIL_SEARCH_CRITERIA'] = 'UNSEEN'
+    if params.get('password'):
+        env['EMAIL_PASSWORD'] = params['password']
+    try:
+        proc = subprocess.Popen([
+            'python', 'main.py'
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        # Stream output to log and attempt crude progress updates
+        for line in proc.stdout:  # type: ignore
+            stripped = line.rstrip()
+            logger.info(f"[job {job_id}] {stripped}")
+            lower = stripped.lower()
+            progress = None
+            # Stage markers
+            if '[1/7]' in stripped:
+                progress = max(5, jobs[job_id].get('progress', 0))
+            elif '[2/7]' in stripped:
+                progress = 15
+            elif '[3/7]' in stripped:
+                progress = max(28, jobs[job_id].get('progress', 0))
+            # Header batch / body fetch hints
+            elif 'performing batched header fetch' in lower:
+                progress = max(32, jobs[job_id].get('progress', 0))
+            elif 'header fetch completed' in lower:
+                progress = max(38, jobs[job_id].get('progress', 0))
+            elif 'will fetch full bodies for' in lower:
+                progress = max(42, jobs[job_id].get('progress', 0))
+            elif 'retrieved ' in lower and ' emails' in lower:
+                progress = max(48, jobs[job_id].get('progress', 0))
+            elif '[4/7]' in stripped:
+                progress = max(58, jobs[job_id].get('progress', 0))
+            elif '[5/7]' in stripped:
+                progress = max(70, jobs[job_id].get('progress', 0))
+            elif '[6/7]' in stripped:
+                progress = max(83, jobs[job_id].get('progress', 0))
+            elif '[7/7]' in stripped:
+                progress = max(92, jobs[job_id].get('progress', 0))
+            elif 'analysis complete' in lower:
+                progress = max(96, jobs[job_id].get('progress', 0))
+            if progress is not None:
+                with jobs_lock:
+                    if jobs.get(job_id):
+                        # Only increase (never regress)
+                        if progress > jobs[job_id].get('progress', 0):
+                            jobs[job_id]['progress'] = progress
+        rc = proc.wait()
+        with jobs_lock:
+            if jobs.get(job_id):
+                jobs[job_id]['status'] = 'completed' if rc == 0 else 'failed'
+                jobs[job_id]['progress'] = 100 if rc == 0 else jobs[job_id].get('progress', 90)
+                jobs[job_id]['return_code'] = rc
+    except Exception as e:
+        logger.exception(f"Job {job_id} failed: {e}")
+        with jobs_lock:
+            if jobs.get(job_id):
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = str(e)
+
 
 def get_latest_file(pattern):
     """Find the most recent file matching pattern in output directory"""
@@ -231,26 +317,39 @@ def get_patterns():
 
 @app.route('/api/run-analysis', methods=['POST'])
 def run_analysis():
-    """Run email analysis (stub for now)"""
     try:
-        config = request.get_json()
-        # In a real implementation, this would trigger the main.py analysis
-        # For now, return a success message
-        return jsonify({
-            'message': 'Analysis started successfully',
-            'job_id': f'job_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
-        })
+        params = request.get_json(force=True) or {}
+        # Simple single-active-job guard: if a job is already running or queued, reuse it
+        reuse_job_id = None
+        with jobs_lock:
+            for jid, info in jobs.items():
+                if info.get('status') in ('queued', 'running'):
+                    reuse_job_id = jid
+                    break
+            if reuse_job_id:
+                logger.info(f"Reusing active job {reuse_job_id} instead of starting a new one")
+                return jsonify({'message': 'Analysis already in progress', 'job_id': reuse_job_id, 'active': True}), 202
+
+            job_id = f"job_{uuid.uuid4().hex[:8]}"
+            jobs[job_id] = {
+                'status': 'queued',
+                'progress': 0,
+                'params': {k: params.get(k) for k in ('email','max_emails','categories','unread_only','password') if k != 'password'}  # do not expose password back
+            }
+        t = threading.Thread(target=_run_analysis_job, args=(job_id, params), daemon=True)
+        t.start()
+        return jsonify({'message': 'Analysis started', 'job_id': job_id, 'active': False})
     except Exception as e:
         logger.error(f"Error running analysis: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/analysis-status/<job_id>', methods=['GET'])
 def get_analysis_status(job_id):
-    """Get analysis status (stub for now)"""
-    return jsonify({
-        'status': 'completed',
-        'progress': 100
-    })
+    with jobs_lock:
+        info = jobs.get(job_id)
+    if not info:
+        return jsonify({'error': 'job not found'}), 404
+    return jsonify({k: v for k, v in info.items() if k in ('status','progress','error','return_code','params')})
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -258,15 +357,25 @@ def health_check():
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
 # Serve React frontend in production
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_frontend(path):
-    """Serve React frontend"""
-    frontend_dir = os.path.join(os.path.dirname(__file__), 'frontend', 'build')
-    if path != "" and os.path.exists(os.path.join(frontend_dir, path)):
-        return send_from_directory(frontend_dir, path)
-    else:
-        return send_from_directory(frontend_dir, 'index.html')
+@app.route('/')
+def serve_root():  # explicit root
+    index_path = os.path.join(_frontend_build_dir, 'index.html')
+    if not os.path.exists(index_path):
+        logger.error(f"index.html not found in {_frontend_build_dir}")
+        abort(500)
+    return send_file(index_path)
+
+@app.errorhandler(404)
+def spa_fallback(e):
+    """Single Page App fallback: serve index.html for non-API 404s."""
+    req_path = request.path
+    if req_path.startswith('/api') or req_path.startswith('/health'):
+        return jsonify({'error': 'Not found'}), 404
+    index_path = os.path.join(_frontend_build_dir, 'index.html')
+    if os.path.exists(index_path):
+        logger.debug(f"SPA fallback for path: {req_path}")
+        return send_file(index_path)
+    return jsonify({'error': 'Not found'}), 404
 
 if __name__ == '__main__':
     # Create output directory if it doesn't exist

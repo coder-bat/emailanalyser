@@ -63,6 +63,12 @@ Visit the **[GitHub Pages Demo](https://coder-bat.github.io/emailanalyser/)** to
 - ⚡ **Performance Optimized**: Newest-first limiting and batching for large mailboxes
 - 🔄 **Flexible Fetch Modes**: Light fetch (headers + limited text) or full RFC822 for robust parsing
 - 📊 **Rich Outputs**: Interactive dashboard, CSV exports, text reports, and optional visualizations
+ - 🚀 **On-Demand Runs**: Trigger fresh analyses from the UI (no manual shell needed)
+ - 🔁 **Single Active Job Guard**: Prevents duplicate heavy analyses; second request reuses current job
+ - 📡 **Streaming Progress Heuristics**: Backend parses `main.py` stage logs to emit % completion
+ - 🔐 **Ephemeral Credential Injection**: Password passed only as env var to subprocess; never persisted in job data
+ - 🛡️ **Newest-First Limiting**: Large mailboxes trimmed to newest `MAX_EMAILS` before heavy processing
+ - 🧠 **Adaptive Fetch Modes**: Light fetch first, upgrade selectively if headers incomplete
 
 ## 🏗️ Architecture
 
@@ -85,6 +91,17 @@ Visit the **[GitHub Pages Demo](https://coder-bat.github.io/emailanalyser/)** to
 1. **React Frontend** (`/frontend`): Modern TypeScript React app with Material-UI
 2. **Flask API Server** (`api_server.py`): RESTful API bridge between frontend and analysis engine
 3. **Python Analysis Engine** (`main.py`): Core email processing and analysis logic
+4. **Job Runner (in `api_server.py`)**: Launches `main.py` subprocess per analysis with progress tracking
+
+### Job Execution Flow
+1. User opens "Run Analysis" dialog in the frontend and supplies email, options, (app) password.
+2. Frontend calls `POST /api/run-analysis`.
+3. API creates a job id (or reuses the running one) and spawns `python main.py` in a thread.
+4. Server tails stdout; regex-based milestones update in-memory job `progress`.
+5. Frontend polls `GET /api/analysis-status/<job_id>` every few seconds to update a linear progress bar.
+6. Upon completion, frontend auto-refreshes datasets (emails, sender stats, recommendations).
+
+The job state currently lives in-process (memory). Using multiple Gunicorn workers will create isolated job maps; for consistent progress reporting run with a single worker (see Recommendation below).
 
 ## 🛠️ Configuration
 
@@ -110,6 +127,13 @@ Visit the **[GitHub Pages Demo](https://coder-bat.github.io/emailanalyser/)** to
 #### API Server
 - `API_PORT`: Flask server port (default: 5000)
 - `OUTPUT_DIR`: Analysis output directory
+- `HOST_API_PORT`: Host port mapping used in docker-compose (e.g. `5050:5000`)
+
+#### Job / Progress Internals (no need to change normally)
+- Progress relies on `main.py` emitting stage markers like `[1/7]`, `[2/7]`, etc.
+- Additional phrases such as `Performing batched header fetch`, `Header fetch completed`, `Will fetch full bodies for`, `Retrieved X emails`, and `Analysis Complete` refine percentages.
+
+> NOTE: Changing those log lines in `main.py` will affect progress resolution; keep markers if you customize.
 
 ### Example Usage
 
@@ -135,6 +159,7 @@ The Flask API server provides these endpoints:
 - `GET /api/important-senders` - High-priority contacts
 - `GET /api/patterns` - Time and category patterns
 - `POST /api/run-analysis` - Trigger new analysis
+- `GET /api/analysis-status/<job_id>` - Poll current job (status, progress)
 - `GET /health` - Health check endpoint
 
 ## 🐳 Docker Deployment  
@@ -164,6 +189,16 @@ docker build -t emailanalyser .
 # Run container
 docker run -p 5000:5000 emailanalyser
 ```
+
+### Recommended Runtime (Single Worker)
+
+Because job tracking is stored in memory, use a single Gunicorn worker for accurate progress:
+
+```bash
+gunicorn --bind 0.0.0.0:5000 --workers 1 --timeout 120 api_server:app
+```
+
+If you need concurrency, consider externalizing job state (Redis / DB) first.
 
 ## 🔄 CI/CD Pipeline
 
@@ -226,6 +261,44 @@ python api_server.py
 - Use Gmail app passwords instead of main password
 - Run containers as non-root user
 - Regular dependency updates via Dependabot
+- Passwords are only set via environment for the subprocess and are not returned by any API endpoint.
+- Avoid enabling multiple workers until job state is externalized.
+
+### Optional Hardening Ideas
+- Add TLS termination with a reverse proxy (Traefik / Caddy / Nginx)
+- Mount a read-only config volume; separate writable `OUTPUT_DIR`
+- Store secrets in Docker/Compose secrets instead of plain env vars
+- Use `EMAIL_DATE_SINCE` (future enhancement) to minimize downloaded messages
+
+## 🧪 Troubleshooting
+
+| Symptom | Cause | Resolution |
+|---------|-------|-----------|
+| Progress bar stalls early | Stage log not yet emitted | Wait for next milestone; check container logs |
+| `job not found` 404 | Multiple Gunicorn workers used | Run with `--workers 1` |
+| 403 / CORS errors in browser | Hardcoded absolute API URL | Use relative paths (already default) |
+| Very large "Search returned" number | IMAP ALL returns every id | Limit via `MAX_EMAILS` & date criteria |
+| Repeated analysis submissions | User clicked multiple times | Guard now reuses active job (202 response) |
+| Password persists in job status | (Should not happen) | Ensure password key excluded in job dict |
+
+Check logs:
+```bash
+docker compose logs --tail=200 emailanalyser
+```
+
+Health endpoint:
+```bash
+curl -s http://localhost:5000/health | jq
+```
+
+## 🗺️ Roadmap (Planned Enhancements)
+
+- Cancel / abort job endpoint
+- Persistent job history (timestamped runs, durations, parameters)
+- Date-based mailbox limiting (`EMAIL_DATE_SINCE`, `EMAIL_DATE_UNTIL`)
+- External state store for multi-worker scaling
+- WebSocket / SSE live progress streaming (reduce polling)
+- Fine-grained per-phase timing metrics
 
 ## 🤝 Contributing
 

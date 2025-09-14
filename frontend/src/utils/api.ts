@@ -1,7 +1,12 @@
 import axios from 'axios';
 import { EmailMessage, SenderStats, ActionableSender, AnalysisPatterns, AnalysisSummary } from '../types';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+// Prefer relative URLs so the frontend served by Flask can call backend without CORS issues.
+// Allow override via REACT_APP_API_BASE_URL (or legacy REACT_APP_API_URL).
+const API_BASE_URL =
+  process.env.REACT_APP_API_BASE_URL ||
+  process.env.REACT_APP_API_URL ||
+  '';
 
 const api = axios.create({
   baseURL: API_BASE_URL,

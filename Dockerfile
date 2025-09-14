@@ -7,15 +7,15 @@ WORKDIR /app/frontend
 # Copy frontend package files
 COPY frontend/package*.json ./
 
-# Install frontend dependencies
-RUN npm ci --only=production
+# Install frontend dependencies (need dev deps for build step like react-scripts)
+RUN npm ci
 
 # Copy frontend source code
 COPY frontend/ ./
 
 # Build frontend for production
 ENV CI=false
-RUN npm run build
+RUN npm run build && test -f build/index.html
 
 # Python backend stage
 FROM python:3.11-slim
@@ -24,26 +24,31 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies including curl for health checks
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    gcc \
+    g++ \
+    libffi-dev \
+    liblapack-dev \
+    libblas-dev \
+    gfortran \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python requirements and install dependencies
 COPY requirements.txt .
 
-# Install with trusted hosts to handle SSL issues
+# Install with trusted hosts to handle SSL issues (requirements already include flask/gunicorn)
 RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org -r requirements.txt
-
-# Install Flask for API server
-RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org flask flask-cors gunicorn
 
 # Copy Python source code
 COPY *.py ./
-COPY tests/ ./tests/ 2>/dev/null || true
+# (Tests directory not copied into container; omit for lean runtime)
 
 # Copy built frontend from previous stage
 COPY --from=frontend-build /app/frontend/build ./frontend/build/
+RUN test -f ./frontend/build/index.html || (echo "ERROR: frontend build missing after copy" && ls -R ./frontend/build || exit 1)
 
 # Create output directory
 RUN mkdir -p email_analysis_output

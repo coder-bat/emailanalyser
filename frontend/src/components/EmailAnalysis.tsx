@@ -68,7 +68,11 @@ const EmailAnalysis: React.FC = () => {
     max_emails: 1000,
     categories: '',
     unread_only: false,
+    password: '',
   });
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<{status:string; progress:number; error?:string} | null>(null);
+  const [jobPolling, setJobPolling] = useState<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -132,10 +136,45 @@ const EmailAnalysis: React.FC = () => {
 
   const handleRunAnalysis = async () => {
     try {
-      await emailAnalysisApi.runAnalysis(analysisConfig);
-      setRunAnalysisOpen(false);
-      // Refresh data after analysis
-      window.location.reload();
+  const { password, ...sendConfig } = analysisConfig;
+  const resp = await emailAnalysisApi.runAnalysis({ ...sendConfig, password });
+      if (resp.job_id) {
+        setActiveJobId(resp.job_id);
+        setJobStatus({ status: 'queued', progress: 0 });
+        setRunAnalysisOpen(false);
+        // Start polling
+        const interval = setInterval(async () => {
+          try {
+            const s = await emailAnalysisApi.getAnalysisStatus(resp.job_id!);
+            setJobStatus({ status: s.status, progress: s.progress || 0, error: s.error });
+            if (s.status === 'completed' || s.status === 'failed') {
+              clearInterval(interval);
+              setJobPolling(null);
+              // Refresh displayed data if success
+              if (s.status === 'completed') {
+                try {
+                  const [emailsData, senderStatsData, deleteData, importantData] = await Promise.all([
+                    emailAnalysisApi.getEmails(100),
+                    emailAnalysisApi.getSenderStats(),
+                    emailAnalysisApi.getSendersToDelete(),
+                    emailAnalysisApi.getImportantSenders(),
+                  ]);
+                  setEmails(emailsData);
+                  setSenderStats(senderStatsData);
+                  setSendersToDelete(deleteData);
+                  setImportantSenders(importantData);
+                } catch (e) {
+                  // ignore refresh errors
+                }
+              }
+            }
+          } catch (e) {
+            clearInterval(interval);
+            setJobPolling(null);
+          }
+        }, 3000);
+        setJobPolling(interval as unknown as NodeJS.Timeout);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run analysis');
     }
@@ -170,6 +209,11 @@ const EmailAnalysis: React.FC = () => {
           Run New Analysis
         </Button>
       </Box>
+      {activeJobId && jobStatus && (
+        <Alert severity={jobStatus.status === 'failed' ? 'error' : 'info'} sx={{ mb: 2 }}>
+          Job {activeJobId}: {jobStatus.status} (progress {jobStatus.progress}%) {jobStatus.error && ` - ${jobStatus.error}`}
+        </Alert>
+      )}
 
       <Paper sx={{ width: '100%' }}>
         <Tabs value={tabValue} onChange={handleTabChange} aria-label="analysis tabs">
@@ -355,6 +399,17 @@ const EmailAnalysis: React.FC = () => {
               />
             }
             label="Unread emails only"
+          />
+          <TextField
+            margin="dense"
+            label="Password / App Password"
+            type="password"
+            fullWidth
+            variant="outlined"
+            value={analysisConfig.password}
+            onChange={(e) => setAnalysisConfig({ ...analysisConfig, password: e.target.value })}
+            sx={{ mb: 1 }}
+            helperText="Use an app-specific password if your provider requires it."
           />
         </DialogContent>
         <DialogActions>

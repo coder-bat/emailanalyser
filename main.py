@@ -16,7 +16,6 @@ import argparse
 import os
 import sys
 import re
-import pickle
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -27,6 +26,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import shlex
+import hashlib
 
 # Data processing and analysis
 import pandas as pd
@@ -240,6 +240,9 @@ class EmailConnector:
 
     def _fetch(self, fetch_set, parts):
         """Try UID fetch, fallback to FETCH if UID not supported."""
+        # Validate fetch_set to prevent injection
+        if not fetch_set or not re.match(r'^[\d,:\s]+$', str(fetch_set)):
+            return ('NO', [b''])
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('fetch', fetch_set, parts)
@@ -268,6 +271,12 @@ class EmailConnector:
     def fetch_email_ids(self, search_criteria: str = 'ALL') -> List[bytes]:
         """Fetch email IDs based on search criteria"""
         try:
+            # Validate search_criteria to prevent injection
+            allowed_criteria = ['ALL', 'UNSEEN', 'SEEN', 'FLAGGED', 'UNFLAGGED', 'DELETED', 'UNDELETED',
+                               'DRAFT', 'UNDRAFT', 'RECENT', 'OLD', 'NEW']
+            if search_criteria.upper() not in allowed_criteria:
+                logger.warning(f"Invalid search criteria '{search_criteria}', defaulting to ALL")
+                search_criteria = 'ALL'
             # Ensure a folder is selected
             folder = self.current_folder or self.config.get('EMAIL', 'folder', 'INBOX')
             try:
@@ -372,8 +381,18 @@ class EmailConnector:
         """
         if not ids:
             return []
-        # prepare string list
-        id_strs = [i.decode() if isinstance(i, (bytes, bytearray)) else str(i) for i in ids]
+        # Validate all IDs are numeric
+        id_strs = []
+        for i in ids:
+            s = i.decode() if isinstance(i, (bytes, bytearray)) else str(i)
+            if not re.match(r'^[\d,\s]+$', s):
+                logger.warning(f"Invalid ID format, skipping: {s}")
+                continue
+            id_strs.append(s)
+        
+        if not id_strs:
+            return []
+        
         mapping = {}
         # Try non-UID fetch to get UID values when id_strs are sequences
         try:

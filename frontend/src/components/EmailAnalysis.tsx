@@ -136,12 +136,27 @@ const EmailAnalysis: React.FC = () => {
 
   const handleRunAnalysis = async () => {
     try {
-  const { password, ...sendConfig } = analysisConfig;
-  const resp = await emailAnalysisApi.runAnalysis({ ...sendConfig, password });
+      // Validate email format before sending
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (analysisConfig.email && !emailRegex.test(analysisConfig.email)) {
+        setError('Please enter a valid email address');
+        return;
+      }
+      
+      // Validate max_emails is positive
+      if (analysisConfig.max_emails < 1 || analysisConfig.max_emails > 10000) {
+        setError('Max emails must be between 1 and 10000');
+        return;
+      }
+      
+      const { password, ...sendConfig } = analysisConfig;
+      const resp = await emailAnalysisApi.runAnalysis({ ...sendConfig, password });
       if (resp.job_id) {
         setActiveJobId(resp.job_id);
         setJobStatus({ status: 'queued', progress: 0 });
         setRunAnalysisOpen(false);
+        // Clear password from state after sending
+        setAnalysisConfig(prev => ({ ...prev, password: '' }));
         // Start polling
         const interval = setInterval(async () => {
           try {

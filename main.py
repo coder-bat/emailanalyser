@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import shlex
+from security_utils import SecurityUtils, ValidationError, SecureFilePath
 
 # Data processing and analysis
 import pandas as pd
@@ -204,6 +205,20 @@ class Configuration:
 class EmailConnector:
     """Handles IMAP connection and email fetching"""
     
+    # Pre-compiled regex patterns for performance
+    _UID_PATTERN = re.compile(r'^[1-9]\d*$')
+    _UID_LIST_PATTERN = re.compile(r'^[1-9]\d*(?:,[1-9]\d*)*$')
+    _FLAGS_PATTERN = re.compile(r'FLAGS \(([^)]*)\)')
+    _SIZE_PATTERN = re.compile(r'RFC822\.SIZE (\d+)')
+    _UID_EXTRACT_PATTERN = re.compile(r'UID (\d+)')
+    _SEQ_EXTRACT_PATTERN = re.compile(r'^(\d+)')
+    _DEADLINE_PATTERNS = [
+        re.compile(r'deadline'),
+        re.compile(r'due date'),
+        re.compile(r'by \d+'),
+        re.compile(r'before \d+')
+    ]
+    
     def __init__(self, config: Configuration):
         self.config = config
         self.connection = None
@@ -231,23 +246,42 @@ class EmailConnector:
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('search', None, *args)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID search failed: {e}")
         try:
             return self.connection.search(None, *args)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"SEARCH failed: {e}")
             return ('NO', [b''])
 
     def _fetch(self, fetch_set, parts):
-        """Try UID fetch, fallback to FETCH if UID not supported."""
+        """Try UID fetch, fallback to FETCH if UID not supported.
+        
+        Validates fetch_set to prevent IMAP command injection.
+        Only accepts positive integers and commas.
+        """
+        # Validate fetch_set to prevent injection
+        if not fetch_set:
+            logger.warning("Empty fetch_set provided to _fetch")
+            return ('NO', [b''])
+        
+        fetch_set_str = str(fetch_set)
+        # Use SecurityUtils for validation
+        if not SecurityUtils.validate_imap_uid_list(fetch_set_str.replace(':', ',')):
+            # Check if it's a single UID
+            if not SecurityUtils.validate_imap_uid(fetch_set_str):
+                logger.warning(f"Invalid fetch_set format rejected: {fetch_set_str[:50]}")
+                return ('NO', [b''])
+        
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('fetch', fetch_set, parts)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID fetch failed: {e}")
         try:
             return self.connection.fetch(fetch_set, parts)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"FETCH failed: {e}")
             return ('NO', [b''])
     
     def select_folder(self, folder: str = None) -> bool:
@@ -853,7 +887,8 @@ class EmailConnector:
                         decoded_parts.append(part.decode(encoding))
                     else:
                         decoded_parts.append(part.decode('utf-8', errors='ignore'))
-                except:
+                except (UnicodeDecodeError, LookupError) as e:
+                    logger.debug(f"Header decode error: {e}")
                     decoded_parts.append(str(part, errors='ignore'))
             else:
                 decoded_parts.append(str(part))
@@ -870,24 +905,30 @@ class EmailConnector:
                 
                 if content_type == "text/plain" and "attachment" not in content_disposition:
                     try:
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        body_parts.append(body)
-                    except:
-                        pass
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            body_parts.append(body)
+                    except (UnicodeDecodeError, AttributeError) as e:
+                        logger.debug(f"Body extraction error (plain): {e}")
                 elif content_type == "text/html" and not body_parts:
                     try:
-                        html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        # Simple HTML to text conversion
-                        text = re.sub('<[^<]+?>', '', html_body)
-                        body_parts.append(text)
-                    except:
-                        pass
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            html_body = payload.decode('utf-8', errors='ignore')
+                            # Simple HTML to text conversion
+                            text = re.sub('<[^<]+?>', '', html_body)
+                            body_parts.append(text)
+                    except (UnicodeDecodeError, AttributeError) as e:
+                        logger.debug(f"Body extraction error (html): {e}")
         else:
             try:
-                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                body_parts.append(body)
-            except:
-                pass
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode('utf-8', errors='ignore')
+                    body_parts.append(body)
+            except (UnicodeDecodeError, AttributeError) as e:
+                logger.debug(f"Body extraction error (single): {e}")
         
         return '\n'.join(body_parts)
     
@@ -931,7 +972,8 @@ class EmailConnector:
                 addr = (addr or '').strip().strip('<>')
                 if '@' in addr:
                     return addr.lower()
-            except Exception:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Sender email extraction error for header {h}: {e}")
                 continue
         return ''
     
@@ -942,8 +984,8 @@ class EmailConnector:
                 self.connection.close()
                 self.connection.logout()
                 logger.info("Disconnected from email server")
-            except:
-                pass
+            except (imaplib.IMAP4.error, OSError) as e:
+                logger.debug(f"Disconnect error (non-critical): {e}")
 
 class EmailCategorizer:
     """NLP-based email categorization"""
@@ -1616,7 +1658,7 @@ class ReportGenerator:
         return report_text
     
     def export_to_csv(self, emails: List[EmailMessage]):
-        """Export email data to CSV for further analysis"""
+        """Export email data to CSV for further analysis with CSV injection protection."""
         filepath = os.path.join(self.output_dir, f"email_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
@@ -1625,12 +1667,13 @@ class ReportGenerator:
             
             writer.writeheader()
             for email in emails:
+                # Sanitize fields to prevent CSV injection
                 writer.writerow({
-                    'date': email.date.isoformat(),
-                    'sender': email.sender,
-                    'sender_email': getattr(email, 'sender_email', ''),
-                    'subject': email.subject,
-                    'category': email.category,
+                    'date': email.date.isoformat() if email.date else '',
+                    'sender': SecurityUtils.sanitize_for_csv(email.sender),
+                    'sender_email': SecurityUtils.sanitize_for_csv(getattr(email, 'sender_email', '')),
+                    'subject': SecurityUtils.sanitize_for_csv(email.subject),
+                    'category': SecurityUtils.sanitize_for_csv(email.category or ''),
                     'importance_score': email.importance_score,
                     'has_attachments': bool(email.attachments)
                 })
@@ -1694,20 +1737,33 @@ class ReportGenerator:
             if avg_importance >= IMPORTANT_AVG_IMPORTANCE or any(k in sender.lower() for k in ('ceo', 'hr@', 'boss', 'manager')):
                 important_senders.append({'sender': sender, 'count': count, 'avg_importance': avg_importance})
 
-        # Write CSVs
+        # Write CSVs with CSV injection protection
         del_path = os.path.join(self.output_dir, 'senders_to_delete.csv')
         with open(del_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance', 'newsletter_pct'])
             writer.writeheader()
             for row in sorted(senders_to_delete, key=lambda r: (-r['count'], r['avg_importance'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance'],
+                    'newsletter_pct': row['newsletter_pct']
+                }
+                writer.writerow(sanitized_row)
 
         imp_path = os.path.join(self.output_dir, 'important_senders.csv')
         with open(imp_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance'])
             writer.writeheader()
             for row in sorted(important_senders, key=lambda r: (-r['avg_importance'], -r['count'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance']
+                }
+                writer.writerow(sanitized_row)
 
         logger.info(f"Senders to delete saved to {del_path}")
         logger.info(f"Important senders saved to {imp_path}")
@@ -1743,7 +1799,10 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(['sender_key', 'sender_label', 'total_emails', 'important_emails'])
             for sender, v in sorted(counts.items(), key=lambda kv: (-kv[1]['total'], -kv[1]['important'])):
-                writer.writerow([sender, v['label'] or sender, v['total'], v['important']])
+                # Sanitize sender fields to prevent CSV injection
+                sanitized_sender = SecurityUtils.sanitize_for_csv(sender)
+                sanitized_label = SecurityUtils.sanitize_for_csv(v['label'] or sender)
+                writer.writerow([sanitized_sender, sanitized_label, v['total'], v['important']])
         logger.info(f"Sender stats saved to {out_path}")
         return out_path
 

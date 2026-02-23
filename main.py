@@ -258,7 +258,7 @@ class EmailConnector:
         """Try UID fetch, fallback to FETCH if UID not supported.
         
         Validates fetch_set to prevent IMAP command injection.
-        Only accepts positive integers and commas.
+        Only accepts positive integers, commas, and colons (for UID ranges).
         """
         # Validate fetch_set to prevent injection
         if not fetch_set:
@@ -267,11 +267,9 @@ class EmailConnector:
         
         fetch_set_str = str(fetch_set)
         # Use SecurityUtils for validation
-        if not SecurityUtils.validate_imap_uid_list(fetch_set_str.replace(':', ',')):
-            # Check if it's a single UID
-            if not SecurityUtils.validate_imap_uid(fetch_set_str):
-                logger.warning(f"Invalid fetch_set format rejected: {fetch_set_str[:50]}")
-                return ('NO', [b''])
+        if not SecurityUtils.validate_imap_fetch_set(fetch_set_str):
+            logger.warning(f"Invalid fetch_set format rejected: {fetch_set_str[:50]}")
+            return ('NO', [b''])
         
         try:
             if hasattr(self.connection, 'uid'):

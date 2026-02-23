@@ -49,10 +49,12 @@ CORS(app, resources={r"/api/*": {"origins": get_cors_origins()}})
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'email_analysis_output')
 API_PORT = int(os.environ.get('API_PORT', 5000))
 MAX_JOBS = int(os.environ.get('MAX_JOBS', '100'))
+JOB_TTL_SECONDS = int(os.environ.get('JOB_TTL_SECONDS', '3600'))  # 1 hour TTL for completed jobs
 
-# In-memory job tracking with size limit
+# In-memory job tracking with size limit and TTL
 jobs_lock = threading.Lock()
 jobs = {}
+job_access_times = {}  # Track last access time for TTL cleanup
 
 def _sanitize_env_value(value):
     """Sanitize environment variable values to prevent command injection."""
@@ -81,16 +83,37 @@ def _validate_positive_int(value, default=None):
         return default
 
 def _cleanup_old_jobs():
-    """Clean up old completed/failed jobs to prevent memory leaks."""
+    """Clean up old completed/failed jobs to prevent memory leaks using TTL."""
     with jobs_lock:
-        # Keep only the last 50 jobs
+        current_time = time.time()
+        jobs_to_remove = []
+        
+        # Remove old completed/failed jobs based on TTL
+        for job_id, job_info in jobs.items():
+            status = job_info.get('status')
+            updated_at = job_info.get('updated_at', 0)
+            
+            if status in ('completed', 'failed'):
+                if current_time - updated_at > JOB_TTL_SECONDS:
+                    jobs_to_remove.append(job_id)
+        
+        # Also enforce MAX_JOBS limit if needed
         if len(jobs) > MAX_JOBS:
-            # Sort by last update time (we'll add timestamps)
+            # Sort by last update time
             sorted_jobs = sorted(jobs.items(), key=lambda x: x[1].get('updated_at', 0))
             # Remove oldest jobs that are completed or failed
-            for job_id, job_info in sorted_jobs[:-MAX_JOBS]:
-                if job_info.get('status') in ('completed', 'failed'):
-                    del jobs[job_id]
+            for job_id, job_info in sorted_jobs:
+                if job_info.get('status') in ('completed', 'failed') and job_id not in jobs_to_remove:
+                    jobs_to_remove.append(job_id)
+                if len(jobs) - len(jobs_to_remove) <= MAX_JOBS:
+                    break
+        
+        # Actually remove the jobs
+        for job_id in jobs_to_remove:
+            if job_id in jobs:
+                del jobs[job_id]
+            if job_id in job_access_times:
+                del job_access_times[job_id]
 
 def _run_analysis_job(job_id: str, params: dict):
     """Worker thread to execute main.py analysis and update job status."""
@@ -102,6 +125,7 @@ def _run_analysis_job(job_id: str, params: dict):
         jobs[job_id]['status'] = 'running'
         jobs[job_id]['progress'] = 5
         jobs[job_id]['updated_at'] = time.time()
+        job_access_times[job_id] = time.time()
     
     env = os.environ.copy()
     # Pass selected params as env vars understood by main.py with sanitization
@@ -114,7 +138,10 @@ def _run_analysis_job(job_id: str, params: dict):
             return
         env['EMAIL_ADDRESS'] = _sanitize_env_value(params['email'])
     
-    max_emails = _validate_positive_int(params.get('max_emails'), 1000)
+    # Validate max_emails with upper bound check
+    is_valid, max_emails = SecurityUtils.validate_max_emails(params.get('max_emails', 1000))
+    if not is_valid:
+        logger.warning(f"Invalid max_emails value, using sanitized value: {max_emails}")
     env['MAX_EMAILS'] = str(max_emails)
     
     if params.get('categories'):
@@ -122,13 +149,18 @@ def _run_analysis_job(job_id: str, params: dict):
         categories = str(params['categories'])
         if SecurityUtils.validate_categories(categories):
             env['GMAIL_CATEGORIES'] = categories[:SecurityUtils.MAX_CATEGORIES_LENGTH]
+        else:
+            logger.warning(f"Invalid categories format rejected: {categories[:50]}")
     
     if params.get('unread_only'):
         env['EMAIL_SEARCH_CRITERIA'] = 'UNSEEN'
     
     if params.get('password'):
         # Password is passed securely via env var, limited length
-        env['EMAIL_PASSWORD'] = SecurityUtils.sanitize_password(params['password'])
+        password = params['password']
+        if len(password) > SecurityUtils.MAX_PASSWORD_LENGTH:
+            logger.warning(f"Password exceeds max length, truncating to {SecurityUtils.MAX_PASSWORD_LENGTH} chars")
+        env['EMAIL_PASSWORD'] = SecurityUtils.sanitize_password(password)
     
     try:
         # Use list instead of string to avoid shell injection
@@ -219,7 +251,8 @@ def _set_cached_response(cache_key, data):
 def get_latest_file(pattern):
     """Find the most recent file matching pattern in output directory"""
     # Sanitize pattern to prevent path traversal
-    if not pattern or not SecureFilePath.validate_path(pattern):
+    if not pattern or not SecurityUtils.validate_path_pattern(pattern):
+        logger.warning(f"Invalid file pattern rejected: {pattern}")
         return None
     
     if not os.path.exists(OUTPUT_DIR):
@@ -232,7 +265,16 @@ def get_latest_file(pattern):
         
         # Sort by modification time, newest first
         files.sort(key=lambda x: os.path.getmtime(os.path.join(OUTPUT_DIR, x)), reverse=True)
-        return os.path.join(OUTPUT_DIR, files[0])
+        result = os.path.join(OUTPUT_DIR, files[0])
+        
+        # Double-check the result is within OUTPUT_DIR (prevent traversal)
+        result_abs = os.path.abspath(result)
+        output_abs = os.path.abspath(OUTPUT_DIR)
+        if not result_abs.startswith(output_abs):
+            logger.warning(f"Path traversal detected: {result}")
+            return None
+        
+        return result
     except (OSError, PermissionError) as e:
         logger.error(f"Error accessing output directory: {e}")
         return None
@@ -449,6 +491,12 @@ def run_analysis():
         if not isinstance(params, dict):
             return jsonify({'error': 'Invalid request body'}), 400
         
+        # Validate max_emails early to prevent DoS
+        is_valid, max_emails = SecurityUtils.validate_max_emails(params.get('max_emails', 1000))
+        if not is_valid:
+            logger.warning(f"Invalid max_emails from client, using: {max_emails}")
+        params['max_emails'] = max_emails
+        
         # Rate limiting: check if too many jobs are queued/running
         with jobs_lock:
             active_count = sum(1 for info in jobs.values() if info.get('status') in ('queued', 'running'))
@@ -474,6 +522,7 @@ def run_analysis():
                 'created_at': time.time(),
                 'updated_at': time.time()
             }
+            job_access_times[job_id] = time.time()
         t = threading.Thread(target=_run_analysis_job, args=(job_id, params), daemon=True)
         t.start()
         return jsonify({'message': 'Analysis started', 'job_id': job_id, 'active': False})
@@ -483,8 +532,14 @@ def run_analysis():
 
 @app.route('/api/analysis-status/<job_id>', methods=['GET'])
 def get_analysis_status(job_id):
+    # Validate job_id format to prevent injection
+    if not SecurityUtils.validate_job_id(job_id):
+        return jsonify({'error': 'Invalid job ID format'}), 400
+    
     with jobs_lock:
         info = jobs.get(job_id)
+        if info:
+            job_access_times[job_id] = time.time()
     if not info:
         return jsonify({'error': 'job not found'}), 404
     return jsonify({k: v for k, v in info.items() if k in ('status','progress','error','return_code','params')})

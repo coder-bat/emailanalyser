@@ -4,7 +4,7 @@ Provides input validation, sanitization, and security helpers.
 """
 import re
 import html
-from typing import Optional
+from typing import Optional, Tuple, Any
 
 
 class SecurityUtils:
@@ -12,17 +12,20 @@ class SecurityUtils:
     
     # Pre-compiled regex patterns for performance
     _UID_PATTERN = re.compile(r'^[1-9]\d*$')  # Only positive integers
-    _UID_LIST_PATTERN = re.compile(r'^[1-9]\d*(?:,[1-9]\d*)*$')  # Comma-separated positive integers
+    _UID_LIST_PATTERN = re.compile(r'^[1-9]\d*(?:(?:,|:)[1-9]\d*)*$')  # Comma or colon-separated positive integers (IMAP UID ranges)
     _EMAIL_PATTERN = re.compile(
         r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     )
     _SAFE_FILENAME_PATTERN = re.compile(r'^[a-zA-Z0-9_.\-]+$')
     _CSV_INJECTION_CHARS = frozenset(['=', '+', '-', '@', '\t', '\r', '\n'])
+    _PATH_TRAVERSAL_PATTERN = re.compile(r'\.\.|^/|\\x00')
+    _IMAP_INJECTION_PATTERN = re.compile(r'[;|&$`\n\r\x00]')  # Dangerous shell/IMAP characters
     
     # Constants for validation
     MAX_ENV_VALUE_LENGTH = 4096
     MAX_PASSWORD_LENGTH = 256
     MAX_CATEGORIES_LENGTH = 100
+    MAX_MAX_EMAILS = 50000  # Upper limit to prevent DoS
     
     @classmethod
     def validate_imap_uid(cls, uid: str) -> bool:
@@ -37,11 +40,33 @@ class SecurityUtils:
     @classmethod
     def validate_imap_uid_list(cls, uid_list: str) -> bool:
         """
-        Validate a comma-separated list of IMAP UIDs.
+        Validate a comma-separated or colon-separated list of IMAP UIDs.
+        Supports IMAP UID ranges like "1:100" for fetching ranges.
         """
         if not uid_list:
             return False
         return bool(cls._UID_LIST_PATTERN.match(str(uid_list)))
+    
+    @classmethod
+    def validate_imap_fetch_set(cls, fetch_set: str) -> bool:
+        """
+        Validate an IMAP fetch set which can be:
+        - Single UID: "123"
+        - Comma-separated UIDs: "1,2,3"
+        - UID range: "1:100"
+        - Combined: "1,5:10,20"
+        
+        Also checks for injection attempts.
+        """
+        if not fetch_set:
+            return False
+        
+        # Check for injection characters
+        if cls._IMAP_INJECTION_PATTERN.search(fetch_set):
+            return False
+        
+        # Validate the format
+        return bool(cls._UID_LIST_PATTERN.match(str(fetch_set)))
     
     @classmethod
     def sanitize_for_csv(cls, value: str) -> str:
@@ -122,14 +147,62 @@ class SecurityUtils:
         return value[:max_length]
     
     @classmethod
+    def validate_max_emails(cls, value: Any) -> Tuple[bool, int]:
+        """
+        Validate max_emails parameter.
+        Returns (is_valid, sanitized_value).
+        """
+        try:
+            val = int(value)
+            if val <= 0:
+                return False, 1000  # Default
+            if val > cls.MAX_MAX_EMAILS:  # Upper limit to prevent DoS
+                return False, cls.MAX_MAX_EMAILS
+            return True, val
+        except (ValueError, TypeError):
+            return False, 1000  # Default
+    
+    @classmethod
+    def validate_job_id(cls, job_id: str) -> bool:
+        """
+        Validate job ID format to prevent injection.
+        Only allows alphanumeric, hyphens, and underscores.
+        """
+        if not job_id:
+            return False
+        return bool(re.match(r'^[a-zA-Z0-9_-]+$', job_id))
+    
+    @classmethod
     def validate_categories(cls, categories: str) -> bool:
         """
         Validate categories parameter to prevent injection.
         Only allows alphanumeric, comma, space, and hyphen.
+        Rejects newlines and other control characters.
         """
         if not categories:
             return True  # Empty is valid
+        # Check for newlines and other dangerous characters
+        if '\n' in categories or '\r' in categories or '\t' in categories:
+            return False
         return bool(re.match(r'^[a-zA-Z0-9,\s\-]+$', categories))
+    
+    @classmethod
+    def validate_path_pattern(cls, pattern: str) -> bool:
+        """
+        Validate file path pattern to prevent directory traversal.
+        """
+        if not pattern:
+            return False
+        
+        # Check for path traversal attempts
+        if cls._PATH_TRAVERSAL_PATTERN.search(pattern):
+            return False
+        
+        # Check for null bytes
+        if '\x00' in pattern:
+            return False
+        
+        return True
     
     @classmethod
     def sanitize_password(cls, password: Optional[str]) -> str:

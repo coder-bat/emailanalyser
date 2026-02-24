@@ -120,6 +120,18 @@ def _run_analysis_job(job_id: str, params: dict):
     """Worker thread to execute main.py analysis and update job status."""
     import time
     
+    # Validate params is a dict
+    if not isinstance(params, dict):
+        logger.error(f"Job {job_id}: params must be a dictionary")
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id].update({
+                    'status': 'failed',
+                    'error': 'Invalid parameters: params must be a dictionary',
+                    'updated_at': time.time()
+                })
+        return
+    
     # Validate job exists before starting
     with jobs_lock:
         if job_id not in jobs:
@@ -283,13 +295,26 @@ def get_latest_file(pattern):
             return None
         
         # Sort by modification time, newest first
-        files.sort(key=lambda x: os.path.getmtime(os.path.join(OUTPUT_DIR, x)), reverse=True)
+        # Handle potential errors during stat
+        def get_mtime_safe(filename):
+            try:
+                return os.path.getmtime(os.path.join(OUTPUT_DIR, filename))
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not get mtime for {filename}: {e}")
+                return 0
+        
+        files.sort(key=get_mtime_safe, reverse=True)
+        
+        # Ensure we have a valid file after sorting
+        if not files or get_mtime_safe(files[0]) == 0:
+            return None
+            
         result = os.path.join(OUTPUT_DIR, files[0])
         
         # Double-check the result is within OUTPUT_DIR (prevent traversal)
         result_abs = os.path.abspath(result)
         output_abs = os.path.abspath(OUTPUT_DIR)
-        if not result_abs.startswith(output_abs):
+        if not result_abs.startswith(output_abs + os.sep) and result_abs != output_abs:
             logger.warning(f"Path traversal detected: {result}")
             return None
         
@@ -371,73 +396,110 @@ def get_summary():
 
 @app.route('/api/emails', methods=['GET'])
 def get_emails():
-    """Get email data"""
+    """Get email data with safe type conversion"""
     try:
         limit = request.args.get('limit', type=int)
         email_data_path = get_latest_file('email_data_')
         email_data = read_csv_file(email_data_path)
         
-        # Convert data types and format
+        # Convert data types and format with error handling
+        processed_emails = []
         for email in email_data:
-            email['importance_score'] = float(email.get('importance_score', 0))
-            email['has_attachments'] = email.get('has_attachments', 'False').lower() == 'true'
+            try:
+                processed_email = {
+                    **email,
+                    'importance_score': float(email.get('importance_score', 0) or 0),
+                    'has_attachments': str(email.get('has_attachments', '')).lower() in ('true', '1', 'yes', 'on')
+                }
+                processed_emails.append(processed_email)
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Error processing email data: {e}")
+                # Include raw data if conversion fails
+                processed_emails.append(email)
         
-        if limit:
-            email_data = email_data[:limit]
+        if limit and limit > 0:
+            processed_emails = processed_emails[:limit]
         
-        return jsonify(email_data)
+        return jsonify(processed_emails)
     except Exception as e:
         logger.error(f"Error getting emails: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sender-stats', methods=['GET'])
 def get_sender_stats():
-    """Get sender statistics"""
+    """Get sender statistics with safe type conversion"""
     try:
         sender_stats_path = os.path.join(OUTPUT_DIR, 'sender_stats.csv')
         sender_data = read_csv_file(sender_stats_path)
         
-        # Convert data types
+        # Convert data types with error handling
+        processed_senders = []
         for sender in sender_data:
-            sender['total_emails'] = int(sender.get('total_emails', 0))
-            sender['important_emails'] = int(sender.get('important_emails', 0))
+            try:
+                processed_sender = {
+                    **sender,
+                    'total_emails': int(sender.get('total_emails', 0) or 0),
+                    'important_emails': int(sender.get('important_emails', 0) or 0)
+                }
+                processed_senders.append(processed_sender)
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Error processing sender data: {e}")
+                processed_senders.append(sender)
         
-        return jsonify(sender_data)
+        return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting sender stats: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/senders-to-delete', methods=['GET'])
 def get_senders_to_delete():
-    """Get senders recommended for deletion"""
+    """Get senders recommended for deletion with safe type conversion"""
     try:
         delete_path = os.path.join(OUTPUT_DIR, 'senders_to_delete.csv')
         delete_data = read_csv_file(delete_path)
         
-        # Convert data types
+        # Convert data types with error handling
+        processed_senders = []
         for sender in delete_data:
-            sender['count'] = int(sender.get('count', 0))
-            sender['avg_importance'] = float(sender.get('avg_importance', 0))
-            sender['newsletter_pct'] = float(sender.get('newsletter_pct', 0))
+            try:
+                processed_sender = {
+                    **sender,
+                    'count': int(sender.get('count', 0) or 0),
+                    'avg_importance': float(sender.get('avg_importance', 0) or 0),
+                    'newsletter_pct': float(sender.get('newsletter_pct', 0) or 0)
+                }
+                processed_senders.append(processed_sender)
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Error processing sender to delete: {e}")
+                processed_senders.append(sender)
         
-        return jsonify(delete_data)
+        return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting senders to delete: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/important-senders', methods=['GET'])
 def get_important_senders():
-    """Get important senders"""
+    """Get important senders with safe type conversion"""
     try:
         important_path = os.path.join(OUTPUT_DIR, 'important_senders.csv')
         important_data = read_csv_file(important_path)
         
-        # Convert data types
+        # Convert data types with error handling
+        processed_senders = []
         for sender in important_data:
-            sender['count'] = int(sender.get('count', 0))
-            sender['avg_importance'] = float(sender.get('avg_importance', 0))
+            try:
+                processed_sender = {
+                    **sender,
+                    'count': int(sender.get('count', 0) or 0),
+                    'avg_importance': float(sender.get('avg_importance', 0) or 0)
+                }
+                processed_senders.append(processed_sender)
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Error processing important sender: {e}")
+                processed_senders.append(sender)
         
-        return jsonify(important_data)
+        return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting important senders: {e}")
         return jsonify({'error': str(e)}), 500

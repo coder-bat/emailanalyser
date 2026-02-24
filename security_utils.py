@@ -26,6 +26,8 @@ class SecurityUtils:
     MAX_PASSWORD_LENGTH = 256
     MAX_CATEGORIES_LENGTH = 100
     MAX_MAX_EMAILS = 50000  # Upper limit to prevent DoS
+    MAX_BATCH_SIZE = 1000   # Upper limit for batch operations
+    MIN_BATCH_SIZE = 1
     
     @classmethod
     def validate_imap_uid(cls, uid: str) -> bool:
@@ -204,6 +206,22 @@ class SecurityUtils:
         
         return True
     
+    @classmethod
+    def validate_batch_size(cls, value: Any) -> Tuple[bool, int]:
+        """
+        Validate batch_size parameter.
+        Returns (is_valid, sanitized_value).
+        """
+        try:
+            val = int(value)
+            if val < cls.MIN_BATCH_SIZE:
+                return False, 100  # Default
+            if val > cls.MAX_BATCH_SIZE:
+                return False, cls.MAX_BATCH_SIZE
+            return True, val
+        except (ValueError, TypeError):
+            return False, 100  # Default
+
     @classmethod
     def sanitize_password(cls, password: Optional[str]) -> str:
         """

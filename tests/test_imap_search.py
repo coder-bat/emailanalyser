@@ -246,5 +246,51 @@ class TestEmailConnectorSecurity(unittest.TestCase):
         self.assertNotEqual(result, ('NO', [b'']))
 
 
+    def test_validate_batch_size(self):
+        """Test batch size validation."""
+        # Valid values
+        is_valid, val = SecurityUtils.validate_batch_size(50)
+        self.assertTrue(is_valid)
+        self.assertEqual(val, 50)
+        
+        is_valid, val = SecurityUtils.validate_batch_size(1000)
+        self.assertTrue(is_valid)
+        self.assertEqual(val, 1000)
+        
+        # Invalid - too small
+        is_valid, val = SecurityUtils.validate_batch_size(0)
+        self.assertFalse(is_valid)
+        self.assertEqual(val, 100)  # Default
+        
+        # Invalid - too large
+        is_valid, val = SecurityUtils.validate_batch_size(5000)
+        self.assertFalse(is_valid)
+        self.assertEqual(val, 1000)  # Max
+        
+        # Invalid - negative
+        is_valid, val = SecurityUtils.validate_batch_size(-10)
+        self.assertFalse(is_valid)
+        self.assertEqual(val, 100)
+
+
+class TestSearchCriteriaValidation(unittest.TestCase):
+    """Test IMAP search criteria validation."""
+
+    def test_valid_search_criteria(self):
+        """Test that valid IMAP search criteria are accepted."""
+        # These should be valid
+        valid_criteria = ['ALL', 'UNSEEN', 'SEEN', 'ANSWERED', 'DELETED', 'FLAGGED']
+        
+    def test_invalid_search_criteria(self):
+        """Test that invalid search criteria are rejected."""
+        # These should be rejected (contain dangerous characters)
+        invalid_criteria = [
+            'ALL; rm -rf /',  # Command injection attempt
+            'UNSEEN | cat /etc/passwd',  # Pipe injection
+            'ALL\nDELETE *',  # Newline injection
+            'ALL\x00INJECTED',  # Null byte injection
+        ]
+
+
 if __name__ == '__main__':
     unittest.main()

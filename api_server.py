@@ -4,6 +4,7 @@ Flask API server for EmailAnalyser frontend
 Provides REST API endpoints to serve email analysis data
 """
 import os
+import sys
 import json
 import csv
 import re
@@ -119,13 +120,21 @@ def _run_analysis_job(job_id: str, params: dict):
     """Worker thread to execute main.py analysis and update job status."""
     import time
     
+    # Validate job exists before starting
     with jobs_lock:
         if job_id not in jobs:
+            logger.error(f"Job {job_id} not found in jobs dictionary")
             return
-        jobs[job_id]['status'] = 'running'
-        jobs[job_id]['progress'] = 5
-        jobs[job_id]['updated_at'] = time.time()
+        # Atomic update of job status
+        jobs[job_id].update({
+            'status': 'running',
+            'progress': 5,
+            'updated_at': time.time()
+        })
         job_access_times[job_id] = time.time()
+    
+    # Use a local variable to track if we've cleaned up to avoid double cleanup
+    cleanup_done = False
     
     env = os.environ.copy()
     # Pass selected params as env vars understood by main.py with sanitization
@@ -163,9 +172,12 @@ def _run_analysis_job(job_id: str, params: dict):
         env['EMAIL_PASSWORD'] = SecurityUtils.sanitize_password(password)
     
     try:
+        # Determine Python executable - prefer python3 for compatibility
+        python_exe = sys.executable if sys.executable else 'python3'
+        
         # Use list instead of string to avoid shell injection
         proc = subprocess.Popen(
-            ['python', 'main.py'],
+            [python_exe, 'main.py'],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -213,18 +225,25 @@ def _run_analysis_job(job_id: str, params: dict):
         rc = proc.wait()
         with jobs_lock:
             if jobs.get(job_id):
-                jobs[job_id]['status'] = 'completed' if rc == 0 else 'failed'
-                jobs[job_id]['progress'] = 100 if rc == 0 else jobs[job_id].get('progress', 90)
-                jobs[job_id]['return_code'] = rc
-                jobs[job_id]['updated_at'] = time.time()
+                jobs[job_id].update({
+                    'status': 'completed' if rc == 0 else 'failed',
+                    'progress': 100 if rc == 0 else jobs[job_id].get('progress', 90),
+                    'return_code': rc,
+                    'updated_at': time.time()
+                })
+        cleanup_done = True
         _cleanup_old_jobs()
     except Exception as e:
         logger.exception(f"Job {job_id} failed: {e}")
         with jobs_lock:
             if jobs.get(job_id):
-                jobs[job_id]['status'] = 'failed'
-                jobs[job_id]['error'] = str(e)
-                jobs[job_id]['updated_at'] = time.time()
+                jobs[job_id].update({
+                    'status': 'failed',
+                    'error': str(e),
+                    'updated_at': time.time()
+                })
+        if not cleanup_done:
+            _cleanup_old_jobs()
 
 
 # Simple in-memory cache for API responses
@@ -502,6 +521,15 @@ def run_analysis():
             active_count = sum(1 for info in jobs.values() if info.get('status') in ('queued', 'running'))
             if active_count >= 3:  # Max 3 concurrent jobs
                 return jsonify({'error': 'Too many active jobs. Please wait for existing jobs to complete.'}), 429
+        
+        # Validate email format if provided
+        if params.get('email') and not _validate_email(params['email']):
+            return jsonify({'error': 'Invalid email address format'}), 400
+        
+        # Validate categories format if provided
+        if params.get('categories'):
+            if not SecurityUtils.validate_categories(str(params['categories'])):
+                return jsonify({'error': 'Invalid categories format'}), 400
         
         # Simple single-active-job guard: if a job is already running or queued, reuse it
         reuse_job_id = None

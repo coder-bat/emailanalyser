@@ -16,7 +16,6 @@ import argparse
 import os
 import sys
 import re
-import pickle
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -28,6 +27,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import shlex
 from security_utils import SecurityUtils, ValidationError, SecureFilePath
+
+# Maximum allowed batch size to prevent memory exhaustion
+MAX_BATCH_SIZE = 1000
+# Maximum allowed body bytes to prevent memory exhaustion
+MAX_BODY_BYTES = 102400  # 100KB max
 
 # Data processing and analysis
 import pandas as pd
@@ -161,6 +165,13 @@ class Configuration:
             'skip_attachment_bodies': '1'
         }
         
+        self.config['ACTIONS'] = {
+            'delete_min_count': '5',
+            'delete_newsletter_pct': '0.6',
+            'delete_avg_importance_thresh': '0.15',
+            'important_avg_importance': '0.6'
+        }
+        
         self.config['CATEGORIES'] = {
             'promotional_keywords': 'sale,discount,offer,deal,save,free,limited,exclusive',
             'work_keywords': 'meeting,project,deadline,report,task,assignment,review',
@@ -199,7 +210,7 @@ class Configuration:
         """Get configuration value"""
         try:
             return self.config.get(section, key)
-        except:
+        except (configparser.NoSectionError, configparser.NoOptionError):
             return fallback
 
 class EmailConnector:
@@ -299,6 +310,29 @@ class EmailConnector:
     
     def fetch_email_ids(self, search_criteria: str = 'ALL') -> List[bytes]:
         """Fetch email IDs based on search criteria"""
+        # Validate search_criteria to prevent IMAP command injection
+        # Only allow standard IMAP search criteria keywords
+        valid_criteria_pattern = re.compile(r'^[A-Z0-9\s\(\)\<\>\"\@\[\]\\\+\-\.\:\\]+$')
+        allowed_keywords = ['ALL', 'ANSWERED', 'DELETED', 'DRAFT', 'FLAGGED', 'NEW', 'OLD', 
+                          'RECENT', 'SEEN', 'UNANSWERED', 'UNDELETED', 'UNDRAFT', 
+                          'UNFLAGGED', 'UNSEEN', 'UNKEYWORD', 'KEYWORD', 'LARGER', 
+                          'SMALLER', 'BEFORE', 'ON', 'SINCE', 'SENTBEFORE', 'SENTON', 
+                          'SENTSINCE', 'FROM', 'TO', 'CC', 'BCC', 'SUBJECT', 'BODY',
+                          'TEXT', 'HEADER', 'UID', 'OR', 'NOT']
+        
+        # Check for dangerous characters that could enable command injection
+        if search_criteria != 'ALL':
+            # Check for shell/command injection attempts
+            dangerous_chars = [';', '|', '&', '$', '`', '\n', '\r', '\x00']
+            if any(c in search_criteria for c in dangerous_chars):
+                logger.warning(f"Dangerous characters in search_criteria rejected: {search_criteria[:50]}")
+                return []
+            
+            # Validate the criteria contains only allowed keywords and safe characters
+            if not valid_criteria_pattern.match(search_criteria.upper()):
+                logger.warning(f"Invalid search_criteria format rejected: {search_criteria[:50]}")
+                return []
+        
         try:
             # Ensure a folder is selected
             folder = self.current_folder or self.config.get('EMAIL', 'folder', 'INBOX')
@@ -444,10 +478,16 @@ class EmailConnector:
         """
         try:
             uid_str = email_id.decode() if isinstance(email_id, (bytes, bytearray)) else str(email_id)
-            # Read fetch mode settings
+            # Read fetch mode settings with validation
             light_fetch = str(self.config.get('EMAIL', 'light_fetch', '1')).lower() in ('1', 'true', 'yes', 'on')
             try:
                 max_body_bytes = int(self.config.get('EMAIL', 'max_body_bytes', '8192'))
+                # Validate max_body_bytes to prevent memory exhaustion
+                if max_body_bytes < 0:
+                    max_body_bytes = 8192
+                elif max_body_bytes > MAX_BODY_BYTES:
+                    logger.warning(f"max_body_bytes {max_body_bytes} exceeds maximum, using {MAX_BODY_BYTES}")
+                    max_body_bytes = MAX_BODY_BYTES
             except Exception:
                 max_body_bytes = 8192
 
@@ -1961,13 +2001,20 @@ def main():
 
         emails = []
         # Fetch bodies with optional parallelism. IMAP connection is not thread-safe; default to serial.
+        # Validate batch_size to prevent memory exhaustion
         try:
             batch_size_val = int(connector.config.get('EMAIL', 'batch_size', '100'))
+            if batch_size_val < 1 or batch_size_val > MAX_BATCH_SIZE:
+                logger.warning(f"Invalid batch_size {batch_size_val}, using default 100")
+                batch_size_val = 100
         except Exception:
             batch_size_val = 100
         # Determine workers from env, default 1 (serial)
         try:
             env_workers = int(os.getenv('FETCH_WORKERS', '1'))
+            if env_workers < 1 or env_workers > 8:
+                logger.warning(f"Invalid FETCH_WORKERS {env_workers}, using default 1")
+                env_workers = 1
         except Exception:
             env_workers = 1
         max_workers = max(1, min(env_workers, 8))

@@ -16,7 +16,6 @@ import argparse
 import os
 import sys
 import re
-import pickle
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -27,6 +26,12 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import shlex
+from security_utils import SecurityUtils, ValidationError, SecureFilePath
+
+# Maximum allowed batch size to prevent memory exhaustion
+MAX_BATCH_SIZE = 1000
+# Maximum allowed body bytes to prevent memory exhaustion
+MAX_BODY_BYTES = 102400  # 100KB max
 
 # Data processing and analysis
 import pandas as pd
@@ -160,6 +165,13 @@ class Configuration:
             'skip_attachment_bodies': '1'
         }
         
+        self.config['ACTIONS'] = {
+            'delete_min_count': '5',
+            'delete_newsletter_pct': '0.6',
+            'delete_avg_importance_thresh': '0.15',
+            'important_avg_importance': '0.6'
+        }
+        
         self.config['CATEGORIES'] = {
             'promotional_keywords': 'sale,discount,offer,deal,save,free,limited,exclusive',
             'work_keywords': 'meeting,project,deadline,report,task,assignment,review',
@@ -198,11 +210,25 @@ class Configuration:
         """Get configuration value"""
         try:
             return self.config.get(section, key)
-        except:
+        except (configparser.NoSectionError, configparser.NoOptionError):
             return fallback
 
 class EmailConnector:
     """Handles IMAP connection and email fetching"""
+    
+    # Pre-compiled regex patterns for performance
+    _UID_PATTERN = re.compile(r'^[1-9]\d*$')
+    _UID_LIST_PATTERN = re.compile(r'^[1-9]\d*(?:,[1-9]\d*)*$')
+    _FLAGS_PATTERN = re.compile(r'FLAGS \(([^)]*)\)')
+    _SIZE_PATTERN = re.compile(r'RFC822\.SIZE (\d+)')
+    _UID_EXTRACT_PATTERN = re.compile(r'UID (\d+)')
+    _SEQ_EXTRACT_PATTERN = re.compile(r'^(\d+)')
+    _DEADLINE_PATTERNS = [
+        re.compile(r'deadline'),
+        re.compile(r'due date'),
+        re.compile(r'by \d+'),
+        re.compile(r'before \d+')
+    ]
     
     def __init__(self, config: Configuration):
         self.config = config
@@ -231,23 +257,40 @@ class EmailConnector:
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('search', None, *args)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID search failed: {e}")
         try:
             return self.connection.search(None, *args)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"SEARCH failed: {e}")
             return ('NO', [b''])
 
     def _fetch(self, fetch_set, parts):
-        """Try UID fetch, fallback to FETCH if UID not supported."""
+        """Try UID fetch, fallback to FETCH if UID not supported.
+        
+        Validates fetch_set to prevent IMAP command injection.
+        Only accepts positive integers, commas, and colons (for UID ranges).
+        """
+        # Validate fetch_set to prevent injection
+        if not fetch_set:
+            logger.warning("Empty fetch_set provided to _fetch")
+            return ('NO', [b''])
+        
+        fetch_set_str = str(fetch_set)
+        # Use SecurityUtils for validation
+        if not SecurityUtils.validate_imap_fetch_set(fetch_set_str):
+            logger.warning(f"Invalid fetch_set format rejected: {fetch_set_str[:50]}")
+            return ('NO', [b''])
+        
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('fetch', fetch_set, parts)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID fetch failed: {e}")
         try:
             return self.connection.fetch(fetch_set, parts)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"FETCH failed: {e}")
             return ('NO', [b''])
     
     def select_folder(self, folder: str = None) -> bool:
@@ -267,6 +310,29 @@ class EmailConnector:
     
     def fetch_email_ids(self, search_criteria: str = 'ALL') -> List[bytes]:
         """Fetch email IDs based on search criteria"""
+        # Validate search_criteria to prevent IMAP command injection
+        # Only allow standard IMAP search criteria keywords
+        valid_criteria_pattern = re.compile(r'^[A-Z0-9\s\(\)\<\>\"\@\[\]\\\+\-\.\:\\]+$')
+        allowed_keywords = ['ALL', 'ANSWERED', 'DELETED', 'DRAFT', 'FLAGGED', 'NEW', 'OLD', 
+                          'RECENT', 'SEEN', 'UNANSWERED', 'UNDELETED', 'UNDRAFT', 
+                          'UNFLAGGED', 'UNSEEN', 'UNKEYWORD', 'KEYWORD', 'LARGER', 
+                          'SMALLER', 'BEFORE', 'ON', 'SINCE', 'SENTBEFORE', 'SENTON', 
+                          'SENTSINCE', 'FROM', 'TO', 'CC', 'BCC', 'SUBJECT', 'BODY',
+                          'TEXT', 'HEADER', 'UID', 'OR', 'NOT']
+        
+        # Check for dangerous characters that could enable command injection
+        if search_criteria != 'ALL':
+            # Check for shell/command injection attempts
+            dangerous_chars = [';', '|', '&', '$', '`', '\n', '\r', '\x00']
+            if any(c in search_criteria for c in dangerous_chars):
+                logger.warning(f"Dangerous characters in search_criteria rejected: {search_criteria[:50]}")
+                return []
+            
+            # Validate the criteria contains only allowed keywords and safe characters
+            if not valid_criteria_pattern.match(search_criteria.upper()):
+                logger.warning(f"Invalid search_criteria format rejected: {search_criteria[:50]}")
+                return []
+        
         try:
             # Ensure a folder is selected
             folder = self.current_folder or self.config.get('EMAIL', 'folder', 'INBOX')
@@ -412,10 +478,16 @@ class EmailConnector:
         """
         try:
             uid_str = email_id.decode() if isinstance(email_id, (bytes, bytearray)) else str(email_id)
-            # Read fetch mode settings
+            # Read fetch mode settings with validation
             light_fetch = str(self.config.get('EMAIL', 'light_fetch', '1')).lower() in ('1', 'true', 'yes', 'on')
             try:
                 max_body_bytes = int(self.config.get('EMAIL', 'max_body_bytes', '8192'))
+                # Validate max_body_bytes to prevent memory exhaustion
+                if max_body_bytes < 0:
+                    max_body_bytes = 8192
+                elif max_body_bytes > MAX_BODY_BYTES:
+                    logger.warning(f"max_body_bytes {max_body_bytes} exceeds maximum, using {MAX_BODY_BYTES}")
+                    max_body_bytes = MAX_BODY_BYTES
             except Exception:
                 max_body_bytes = 8192
 
@@ -853,7 +925,8 @@ class EmailConnector:
                         decoded_parts.append(part.decode(encoding))
                     else:
                         decoded_parts.append(part.decode('utf-8', errors='ignore'))
-                except:
+                except (UnicodeDecodeError, LookupError) as e:
+                    logger.debug(f"Header decode error: {e}")
                     decoded_parts.append(str(part, errors='ignore'))
             else:
                 decoded_parts.append(str(part))
@@ -870,24 +943,30 @@ class EmailConnector:
                 
                 if content_type == "text/plain" and "attachment" not in content_disposition:
                     try:
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        body_parts.append(body)
-                    except:
-                        pass
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            body_parts.append(body)
+                    except (UnicodeDecodeError, AttributeError) as e:
+                        logger.debug(f"Body extraction error (plain): {e}")
                 elif content_type == "text/html" and not body_parts:
                     try:
-                        html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        # Simple HTML to text conversion
-                        text = re.sub('<[^<]+?>', '', html_body)
-                        body_parts.append(text)
-                    except:
-                        pass
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            html_body = payload.decode('utf-8', errors='ignore')
+                            # Simple HTML to text conversion
+                            text = re.sub('<[^<]+?>', '', html_body)
+                            body_parts.append(text)
+                    except (UnicodeDecodeError, AttributeError) as e:
+                        logger.debug(f"Body extraction error (html): {e}")
         else:
             try:
-                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                body_parts.append(body)
-            except:
-                pass
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode('utf-8', errors='ignore')
+                    body_parts.append(body)
+            except (UnicodeDecodeError, AttributeError) as e:
+                logger.debug(f"Body extraction error (single): {e}")
         
         return '\n'.join(body_parts)
     
@@ -931,7 +1010,8 @@ class EmailConnector:
                 addr = (addr or '').strip().strip('<>')
                 if '@' in addr:
                     return addr.lower()
-            except Exception:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Sender email extraction error for header {h}: {e}")
                 continue
         return ''
     
@@ -942,8 +1022,8 @@ class EmailConnector:
                 self.connection.close()
                 self.connection.logout()
                 logger.info("Disconnected from email server")
-            except:
-                pass
+            except (imaplib.IMAP4.error, OSError) as e:
+                logger.debug(f"Disconnect error (non-critical): {e}")
 
 class EmailCategorizer:
     """NLP-based email categorization"""
@@ -1616,7 +1696,7 @@ class ReportGenerator:
         return report_text
     
     def export_to_csv(self, emails: List[EmailMessage]):
-        """Export email data to CSV for further analysis"""
+        """Export email data to CSV for further analysis with CSV injection protection."""
         filepath = os.path.join(self.output_dir, f"email_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
@@ -1625,12 +1705,13 @@ class ReportGenerator:
             
             writer.writeheader()
             for email in emails:
+                # Sanitize fields to prevent CSV injection
                 writer.writerow({
-                    'date': email.date.isoformat(),
-                    'sender': email.sender,
-                    'sender_email': getattr(email, 'sender_email', ''),
-                    'subject': email.subject,
-                    'category': email.category,
+                    'date': email.date.isoformat() if email.date else '',
+                    'sender': SecurityUtils.sanitize_for_csv(email.sender),
+                    'sender_email': SecurityUtils.sanitize_for_csv(getattr(email, 'sender_email', '')),
+                    'subject': SecurityUtils.sanitize_for_csv(email.subject),
+                    'category': SecurityUtils.sanitize_for_csv(email.category or ''),
                     'importance_score': email.importance_score,
                     'has_attachments': bool(email.attachments)
                 })
@@ -1694,20 +1775,33 @@ class ReportGenerator:
             if avg_importance >= IMPORTANT_AVG_IMPORTANCE or any(k in sender.lower() for k in ('ceo', 'hr@', 'boss', 'manager')):
                 important_senders.append({'sender': sender, 'count': count, 'avg_importance': avg_importance})
 
-        # Write CSVs
+        # Write CSVs with CSV injection protection
         del_path = os.path.join(self.output_dir, 'senders_to_delete.csv')
         with open(del_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance', 'newsletter_pct'])
             writer.writeheader()
             for row in sorted(senders_to_delete, key=lambda r: (-r['count'], r['avg_importance'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance'],
+                    'newsletter_pct': row['newsletter_pct']
+                }
+                writer.writerow(sanitized_row)
 
         imp_path = os.path.join(self.output_dir, 'important_senders.csv')
         with open(imp_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance'])
             writer.writeheader()
             for row in sorted(important_senders, key=lambda r: (-r['avg_importance'], -r['count'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance']
+                }
+                writer.writerow(sanitized_row)
 
         logger.info(f"Senders to delete saved to {del_path}")
         logger.info(f"Important senders saved to {imp_path}")
@@ -1743,7 +1837,10 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(['sender_key', 'sender_label', 'total_emails', 'important_emails'])
             for sender, v in sorted(counts.items(), key=lambda kv: (-kv[1]['total'], -kv[1]['important'])):
-                writer.writerow([sender, v['label'] or sender, v['total'], v['important']])
+                # Sanitize sender fields to prevent CSV injection
+                sanitized_sender = SecurityUtils.sanitize_for_csv(sender)
+                sanitized_label = SecurityUtils.sanitize_for_csv(v['label'] or sender)
+                writer.writerow([sanitized_sender, sanitized_label, v['total'], v['important']])
         logger.info(f"Sender stats saved to {out_path}")
         return out_path
 
@@ -1904,13 +2001,20 @@ def main():
 
         emails = []
         # Fetch bodies with optional parallelism. IMAP connection is not thread-safe; default to serial.
+        # Validate batch_size to prevent memory exhaustion
         try:
             batch_size_val = int(connector.config.get('EMAIL', 'batch_size', '100'))
+            if batch_size_val < 1 or batch_size_val > MAX_BATCH_SIZE:
+                logger.warning(f"Invalid batch_size {batch_size_val}, using default 100")
+                batch_size_val = 100
         except Exception:
             batch_size_val = 100
         # Determine workers from env, default 1 (serial)
         try:
             env_workers = int(os.getenv('FETCH_WORKERS', '1'))
+            if env_workers < 1 or env_workers > 8:
+                logger.warning(f"Invalid FETCH_WORKERS {env_workers}, using default 1")
+                env_workers = 1
         except Exception:
             env_workers = 1
         max_workers = max(1, min(env_workers, 8))

@@ -16,7 +16,6 @@ import argparse
 import os
 import sys
 import re
-import pickle
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Any
@@ -27,6 +26,12 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import shlex
+from security_utils import SecurityUtils, ValidationError, SecureFilePath
+
+# Maximum allowed batch size to prevent memory exhaustion
+MAX_BATCH_SIZE = 1000
+# Maximum allowed body bytes to prevent memory exhaustion
+MAX_BODY_BYTES = 102400  # 100KB max
 
 # Data processing and analysis
 import pandas as pd
@@ -135,7 +140,7 @@ class EmailMessage:
 
 class Configuration:
     """Configuration manager for the email analyzer"""
-    
+
     def __init__(self, config_file: str = 'config.ini'):
         self.config = configparser.ConfigParser()
         self.config_file = config_file
@@ -144,7 +149,7 @@ class Configuration:
             self.config.read(config_file)
         else:
             self.save_config()
-    
+
     def load_default_config(self):
         """Load default configuration values"""
         self.config['EMAIL'] = {
@@ -159,7 +164,14 @@ class Configuration:
             'max_body_bytes': '8192',
             'skip_attachment_bodies': '1'
         }
-        
+
+        self.config['ACTIONS'] = {
+            'delete_min_count': '5',
+            'delete_newsletter_pct': '0.6',
+            'delete_avg_importance_thresh': '0.15',
+            'important_avg_importance': '0.6'
+        }
+
         self.config['CATEGORIES'] = {
             'promotional_keywords': 'sale,discount,offer,deal,save,free,limited,exclusive',
             'work_keywords': 'meeting,project,deadline,report,task,assignment,review',
@@ -167,7 +179,7 @@ class Configuration:
             'newsletter_keywords': 'newsletter,digest,update,weekly,monthly,subscribe',
             'spam_keywords': 'winner,claim,urgent,act now,million,prize'
         }
-        
+
         self.config['IMPORTANCE'] = {
             'high_priority_senders': '',
             'vip_domains': 'company.com,important.org',
@@ -175,40 +187,54 @@ class Configuration:
             'important_keywords': 'important,priority,attention,action required',
             'important_threshold': '0.6'
         }
-        
+
         self.config['ARCHIVING'] = {
             'archive_after_days': '90',
             'archive_low_importance_threshold': '0.3',
             'archive_folder': 'Archive'
         }
-        
+
         self.config['VISUALIZATION'] = {
             'export_format': 'html',
             'chart_style': 'seaborn',
             'color_palette': 'Set2',
             'enabled': '0'
         }
-    
+
     def save_config(self):
         """Save configuration to file"""
         with open(self.config_file, 'w') as f:
             self.config.write(f)
-    
+
     def get(self, section: str, key: str, fallback: Any = None) -> Any:
         """Get configuration value"""
         try:
             return self.config.get(section, key)
-        except:
+        except (configparser.NoSectionError, configparser.NoOptionError):
             return fallback
 
 class EmailConnector:
     """Handles IMAP connection and email fetching"""
-    
+
+    # Pre-compiled regex patterns for performance
+    _UID_PATTERN = re.compile(r'^[1-9]\d*$')
+    _UID_LIST_PATTERN = re.compile(r'^[1-9]\d*(?:,[1-9]\d*)*$')
+    _FLAGS_PATTERN = re.compile(r'FLAGS \(([^)]*)\)')
+    _SIZE_PATTERN = re.compile(r'RFC822\.SIZE (\d+)')
+    _UID_EXTRACT_PATTERN = re.compile(r'UID (\d+)')
+    _SEQ_EXTRACT_PATTERN = re.compile(r'^(\d+)')
+    _DEADLINE_PATTERNS = [
+        re.compile(r'deadline'),
+        re.compile(r'due date'),
+        re.compile(r'by \d+'),
+        re.compile(r'before \d+')
+    ]
+
     def __init__(self, config: Configuration):
         self.config = config
         self.connection = None
         self.current_folder = None
-    
+
     def connect(self) -> bool:
         """Establish IMAP connection"""
         try:
@@ -216,7 +242,7 @@ class EmailConnector:
             port = int(self.config.get('EMAIL', 'port'))
             username = self.config.get('EMAIL', 'username')
             password = self.config.get('EMAIL', 'password')
-            
+
             logger.info(f"Connecting to {server}:{port}")
             self.connection = imaplib.IMAP4_SSL(server, port)
             self.connection.login(username, password)
@@ -231,30 +257,47 @@ class EmailConnector:
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('search', None, *args)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID search failed: {e}")
         try:
             return self.connection.search(None, *args)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"SEARCH failed: {e}")
             return ('NO', [b''])
 
     def _fetch(self, fetch_set, parts):
-        """Try UID fetch, fallback to FETCH if UID not supported."""
+        """Try UID fetch, fallback to FETCH if UID not supported.
+
+        Validates fetch_set to prevent IMAP command injection.
+        Only accepts positive integers, commas, and colons (for UID ranges).
+        """
+        # Validate fetch_set to prevent injection
+        if not fetch_set:
+            logger.warning("Empty fetch_set provided to _fetch")
+            return ('NO', [b''])
+
+        fetch_set_str = str(fetch_set)
+        # Use SecurityUtils for validation
+        if not SecurityUtils.validate_imap_fetch_set(fetch_set_str):
+            logger.warning(f"Invalid fetch_set format rejected: {fetch_set_str[:50]}")
+            return ('NO', [b''])
+
         try:
             if hasattr(self.connection, 'uid'):
                 return self.connection.uid('fetch', fetch_set, parts)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UID fetch failed: {e}")
         try:
             return self.connection.fetch(fetch_set, parts)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"FETCH failed: {e}")
             return ('NO', [b''])
-    
+
     def select_folder(self, folder: str = None) -> bool:
         """Select email folder"""
         if not self.connection:
             return False
-        
+
         folder = folder or self.config.get('EMAIL', 'folder', 'INBOX')
         try:
             self.connection.select(folder)
@@ -264,9 +307,45 @@ class EmailConnector:
         except Exception as e:
             logger.error(f"Failed to select folder {folder}: {str(e)}")
             return False
-    
+
     def fetch_email_ids(self, search_criteria: str = 'ALL') -> List[bytes]:
         """Fetch email IDs based on search criteria"""
+        # Validate search_criteria to prevent IMAP command injection
+        # Only allow standard IMAP search criteria keywords
+        valid_criteria_pattern = re.compile(r'^[A-Z0-9\s\(\)\<\>\"\@\[\]\\\+\-\.\:\\]+$')
+        allowed_keywords = ['ALL', 'ANSWERED', 'DELETED', 'DRAFT', 'FLAGGED', 'NEW', 'OLD',
+                          'RECENT', 'SEEN', 'UNANSWERED', 'UNDELETED', 'UNDRAFT',
+                          'UNFLAGGED', 'UNSEEN', 'UNKEYWORD', 'KEYWORD', 'LARGER',
+                          'SMALLER', 'BEFORE', 'ON', 'SINCE', 'SENTBEFORE', 'SENTON',
+                          'SENTSINCE', 'FROM', 'TO', 'CC', 'BCC', 'SUBJECT', 'BODY',
+                          'TEXT', 'HEADER', 'UID', 'OR', 'NOT']
+
+        # Check for dangerous characters that could enable command injection
+        if search_criteria != 'ALL':
+            # Check for shell/command injection attempts
+            dangerous_chars = [';', '|', '&', '$', '`', '\n', '\r', '\x00']
+            if any(c in search_criteria for c in dangerous_chars):
+                logger.warning(f"Dangerous characters in search_criteria rejected: {search_criteria[:50]}")
+                return []
+
+            # Validate the criteria contains only allowed keywords and safe characters
+            if not valid_criteria_pattern.match(search_criteria.upper()):
+                logger.warning(f"Invalid search_criteria format rejected: {search_criteria[:50]}")
+                return []
+
+            # Additional validation: ensure criteria doesn't contain stacked operators that could cause DoS
+            # Limit consecutive spaces and overall length
+            if len(search_criteria) > 200:
+                logger.warning(f"Search criteria too long, truncating: {search_criteria[:50]}...")
+                search_criteria = search_criteria[:200]
+
+            # Check for potentially dangerous stacked OR/NOT patterns that could cause server load issues
+            or_count = search_criteria.upper().count(' OR ')
+            not_count = search_criteria.upper().count(' NOT ')
+            if or_count > 5 or not_count > 5:
+                logger.warning(f"Too many OR/NOT operators in search criteria, rejecting: {search_criteria[:50]}")
+                return []
+
         try:
             # Ensure a folder is selected
             folder = self.current_folder or self.config.get('EMAIL', 'folder', 'INBOX')
@@ -372,12 +451,28 @@ class EmailConnector:
         """
         if not ids:
             return []
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_ids = []
+        for i in ids:
+            i_str = i.decode() if isinstance(i, (bytes, bytearray)) else str(i)
+            if i_str not in seen:
+                seen.add(i_str)
+                unique_ids.append(i)
+
         # prepare string list
-        id_strs = [i.decode() if isinstance(i, (bytes, bytearray)) else str(i) for i in ids]
+        id_strs = [i.decode() if isinstance(i, (bytes, bytearray)) else str(i) for i in unique_ids]
         mapping = {}
+
         # Try non-UID fetch to get UID values when id_strs are sequences
         try:
             fetch_set = ','.join(id_strs)
+            # Validate fetch_set before using
+            if not SecurityUtils.validate_imap_fetch_set(fetch_set):
+                logger.warning(f"Invalid fetch_set in ensure_uids, returning as-is")
+                return [s.encode() for s in id_strs]
+
             typ, data = self.connection.fetch(fetch_set, '(UID)')
             if typ == 'OK' and isinstance(data, list):
                 for resp in data:
@@ -387,22 +482,26 @@ class EmailConnector:
                         m_uid = re.search(r"UID (\d+)", info)
                         if m_seq and m_uid:
                             mapping[m_seq.group(1)] = m_uid.group(1)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"ensure_uids fetch error: {e}")
+
         if mapping:
             return [mapping.get(s, s).encode() for s in id_strs]
+
         # Try UID fetch identity mapping
         try:
             fetch_set = ','.join(id_strs)
-            typ, data = self.connection.uid('fetch', fetch_set, '(UID)')
-            if typ == 'OK' and isinstance(data, list):
-                # If we got responses, assume inputs were UIDs; return as-bytes in same order
-                return [s.encode() for s in id_strs]
-        except Exception:
-            pass
+            if SecurityUtils.validate_imap_fetch_set(fetch_set):
+                typ, data = self.connection.uid('fetch', fetch_set, '(UID)')
+                if typ == 'OK' and isinstance(data, list):
+                    # If we got responses, assume inputs were UIDs; return as-bytes in same order
+                    return [s.encode() for s in id_strs]
+        except Exception as e:
+            logger.debug(f"ensure_uids UID fetch error: {e}")
+
         # Fallback: return as-is
         return [s.encode() for s in id_strs]
-    
+
     def fetch_email(self, email_id: bytes) -> Optional[EmailMessage]:
         """Fetch and parse a single email.
 
@@ -412,10 +511,16 @@ class EmailConnector:
         """
         try:
             uid_str = email_id.decode() if isinstance(email_id, (bytes, bytearray)) else str(email_id)
-            # Read fetch mode settings
+            # Read fetch mode settings with validation
             light_fetch = str(self.config.get('EMAIL', 'light_fetch', '1')).lower() in ('1', 'true', 'yes', 'on')
             try:
                 max_body_bytes = int(self.config.get('EMAIL', 'max_body_bytes', '8192'))
+                # Validate max_body_bytes to prevent memory exhaustion
+                if max_body_bytes < 0:
+                    max_body_bytes = 8192
+                elif max_body_bytes > MAX_BODY_BYTES:
+                    logger.warning(f"max_body_bytes {max_body_bytes} exceeds maximum, using {MAX_BODY_BYTES}")
+                    max_body_bytes = MAX_BODY_BYTES
             except Exception:
                 max_body_bytes = 8192
 
@@ -839,12 +944,12 @@ class EmailConnector:
                     logger.debug(f"Per-ID header fallback failed for {uid}: {e}")
 
         return results
-    
+
     def _decode_header(self, header: str) -> str:
         """Decode email header"""
         if not header:
             return ""
-        
+
         decoded_parts = []
         for part, encoding in decode_header(header):
             if isinstance(part, bytes):
@@ -853,48 +958,94 @@ class EmailConnector:
                         decoded_parts.append(part.decode(encoding))
                     else:
                         decoded_parts.append(part.decode('utf-8', errors='ignore'))
-                except:
+                except (UnicodeDecodeError, LookupError) as e:
+                    logger.debug(f"Header decode error: {e}")
                     decoded_parts.append(str(part, errors='ignore'))
             else:
                 decoded_parts.append(str(part))
         return ' '.join(decoded_parts)
-    
+
     def _extract_body(self, msg: email.message.Message) -> str:
-        """Extract email body text"""
+        """Extract email body text with improved error handling for malformed messages."""
         body_parts = []
-        
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                content_disposition = str(part.get("Content-Disposition", ""))
-                
-                if content_type == "text/plain" and "attachment" not in content_disposition:
+
+        if not msg:
+            return ""
+
+        # Safely check if message is multipart - handle exceptions
+        try:
+            is_multipart = msg.is_multipart()
+        except Exception as e:
+            logger.debug(f"Error checking multipart status: {e}")
+            is_multipart = False
+
+        try:
+            if is_multipart:
+                # Track if we found any valid parts
+                found_valid_part = False
+                for part in msg.walk():
                     try:
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        content_type = part.get_content_type()
+                        content_disposition = str(part.get("Content-Disposition", ""))
+
+                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                            try:
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    body = payload.decode('utf-8', errors='ignore')
+                                    if body.strip():
+                                        body_parts.append(body)
+                                        found_valid_part = True
+                            except (UnicodeDecodeError, AttributeError) as e:
+                                logger.debug(f"Body extraction error (plain): {e}")
+                        elif content_type == "text/html" and not body_parts:
+                            try:
+                                payload = part.get_payload(decode=True)
+                                if payload:
+                                    html_body = payload.decode('utf-8', errors='ignore')
+                                    # Simple HTML to text conversion
+                                    text = re.sub('<[^\u003c]+?\u003e', '', html_body)
+                                    if text.strip():
+                                        body_parts.append(text)
+                                        found_valid_part = True
+                            except (UnicodeDecodeError, AttributeError) as e:
+                                logger.debug(f"Body extraction error (html): {e}")
+                    except Exception as e:
+                        logger.debug(f"Error processing message part: {e}")
+                        continue
+
+                # If we walked but found nothing, try getting payload directly
+                if not found_valid_part:
+                    try:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            return payload.decode('utf-8', errors='ignore')
+                    except Exception as e:
+                        logger.debug(f"Fallback body extraction error: {e}")
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode('utf-8', errors='ignore')
                         body_parts.append(body)
-                    except:
-                        pass
-                elif content_type == "text/html" and not body_parts:
-                    try:
-                        html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        # Simple HTML to text conversion
-                        text = re.sub('<[^<]+?>', '', html_body)
-                        body_parts.append(text)
-                    except:
-                        pass
-        else:
+                except (UnicodeDecodeError, AttributeError) as e:
+                    logger.debug(f"Body extraction error (single): {e}")
+        except Exception as e:
+            logger.debug(f"Error in _extract_body: {e}")
+            # Final fallback: try to get string payload
             try:
-                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                body_parts.append(body)
-            except:
+                payload = msg.get_payload()
+                if isinstance(payload, str):
+                    return payload
+            except Exception:
                 pass
-        
+
         return '\n'.join(body_parts)
-    
+
     def _extract_attachments(self, msg: email.message.Message) -> List[str]:
         """Extract attachment filenames"""
         attachments = []
-        
+
         if msg.is_multipart():
             for part in msg.walk():
                 content_disposition = str(part.get("Content-Disposition", ""))
@@ -902,7 +1053,7 @@ class EmailConnector:
                     filename = part.get_filename()
                     if filename:
                         attachments.append(self._decode_header(filename))
-        
+
         return attachments
 
     def _extract_sender_email(self, msg: email.message.Message) -> str:
@@ -931,10 +1082,11 @@ class EmailConnector:
                 addr = (addr or '').strip().strip('<>')
                 if '@' in addr:
                     return addr.lower()
-            except Exception:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Sender email extraction error for header {h}: {e}")
                 continue
         return ''
-    
+
     def disconnect(self):
         """Close IMAP connection"""
         if self.connection:
@@ -942,53 +1094,69 @@ class EmailConnector:
                 self.connection.close()
                 self.connection.logout()
                 logger.info("Disconnected from email server")
-            except:
-                pass
+            except (imaplib.IMAP4.error, OSError) as e:
+                logger.debug(f"Disconnect error (non-critical): {e}")
 
 class EmailCategorizer:
     """NLP-based email categorization"""
-    
+
     def __init__(self, config: Configuration):
         self.config = config
         self.categories = ['promotional', 'work', 'personal', 'newsletter', 'spam', 'other']
-        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-        self.classifier = MultinomialNB()
+        self.vectorizer = None
+        self.classifier = None
         self.pipeline = None
+        
+        # Only initialize ML components if sklearn is available
+        if SKLEARN_AVAILABLE and TfidfVectorizer is not None and MultinomialNB is not None:
+            try:
+                self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+                self.classifier = MultinomialNB()
+            except Exception as e:
+                logger.debug(f"Failed to initialize ML components: {e}")
+                self.vectorizer = None
+                self.classifier = None
+        
         try:
             self.sia = SentimentIntensityAnalyzer()
         except Exception:
             self.sia = None
-    
+
     def train_classifier(self, emails: List[EmailMessage]):
         """Train the email classifier"""
+        # Skip training if ML components are not available
+        if not SKLEARN_AVAILABLE or self.vectorizer is None or self.classifier is None:
+            logger.debug("ML classifier not available, skipping training")
+            return
+            
         # Create training data based on keywords
         training_data = []
         training_labels = []
-        
+
         for email in emails:
             text = f"{email.subject} {email.body}"
             category = self._categorize_by_keywords(text, email.sender)
             training_data.append(text)
             training_labels.append(category)
-        
+
         if len(set(training_labels)) > 1:
             # Create and train pipeline
             self.pipeline = Pipeline([
                 ('vectorizer', self.vectorizer),
                 ('classifier', self.classifier)
             ])
-            
+
             self.pipeline.fit(training_data, training_labels)
             logger.info("Email classifier trained successfully")
         else:
             logger.warning("Not enough diverse data to train classifier")
-    
+
     def categorize(self, email: EmailMessage) -> str:
         """Categorize an email"""
         if email.category:
             return email.category
         text = f"{email.subject} {email.body}"
-        
+
         # Try ML classification first if available
         if self.pipeline:
             try:
@@ -997,34 +1165,34 @@ class EmailCategorizer:
                 return category
             except:
                 pass
-        
+
         # Fallback to keyword-based categorization
         category = self._categorize_by_keywords(text, email.sender)
         email.category = category
         return category
-    
+
     def _categorize_by_keywords(self, text: str, sender: str) -> str:
         """Categorize email based on keywords"""
         text_lower = text.lower()
-        
+
         # Check each category
         categories_scores = {}
-        
+
         for category in ['promotional', 'work', 'personal', 'newsletter', 'spam']:
             keywords = self.config.get('CATEGORIES', f'{category}_keywords', '').split(',')
             score = sum(1 for keyword in keywords if keyword.strip() in text_lower)
             categories_scores[category] = score
-        
+
         # Check sender patterns
         if 'noreply' in sender.lower() or 'newsletter' in sender.lower():
             categories_scores['newsletter'] += 2
-        
+
         # Return category with highest score
         if max(categories_scores.values()) > 0:
             return max(categories_scores, key=categories_scores.get)
-        
+
         return 'other'
-    
+
     def calculate_sentiment(self, email: EmailMessage) -> float:
         """Calculate email sentiment score"""
         text = f"{email.subject} {email.body}"
@@ -1037,99 +1205,103 @@ class EmailCategorizer:
 
 class ImportanceScorer:
     """Calculate email importance scores"""
-    
+
     def __init__(self, config: Configuration):
         self.config = config
         self.sender_scores = defaultdict(float)
-    
+
     def calculate_importance(self, email: EmailMessage, all_emails: List[EmailMessage] = None) -> float:
         """Calculate importance score for an email"""
         score = 0.0
-        
+
         # 1. Sender importance (30%)
         base_sender = email.sender_email if getattr(email, 'sender_email', '') else email.sender
         sender_score = self._calculate_sender_score(base_sender, all_emails)
         score += sender_score * 0.3
-        
+
         # 2. Subject/content urgency (25%)
         urgency_score = self._calculate_urgency_score(email)
         score += urgency_score * 0.25
-        
+
         # 3. Recency (20%)
         recency_score = self._calculate_recency_score(email.date)
         score += recency_score * 0.2
-        
+
         # 4. Personal relevance (15%)
         relevance_score = self._calculate_relevance_score(email)
         score += relevance_score * 0.15
-        
+
         # 5. Attachments (10%)
         if email.attachments:
             score += 0.1
-        
+
         email.importance_score = min(score, 1.0)
         return email.importance_score
-    
+
     def _calculate_sender_score(self, sender: str, all_emails: List[EmailMessage] = None) -> float:
         """Calculate sender importance score"""
         score = 0.5  # Base score
-        
+
         # Check VIP domains
         vip_domains = self.config.get('IMPORTANCE', 'vip_domains', '').split(',')
         for domain in vip_domains:
             if domain.strip() and domain.strip() in sender.lower():
                 score += 0.3
                 break
-        
+
         # Check high priority senders
         priority_senders = self.config.get('IMPORTANCE', 'high_priority_senders', '').split(',')
         for priority_sender in priority_senders:
             if priority_sender.strip() and priority_sender.strip() in sender.lower():
                 score += 0.5
                 break
-        
+
         # Calculate sender frequency if we have email history
         if all_emails and sender in self.sender_scores:
             score += self.sender_scores[sender] * 0.2
-        
+
         return min(score, 1.0)
-    
+
     def _calculate_urgency_score(self, email: EmailMessage) -> float:
         """Calculate urgency score based on keywords"""
         score = 0.0
         text = f"{email.subject} {email.body}".lower()
-        
+
         # Urgent keywords
         urgent_keywords = self.config.get('IMPORTANCE', 'urgent_keywords', '').split(',')
         for keyword in urgent_keywords:
             if keyword.strip() in text:
                 score += 0.5
                 break
-        
+
         # Important keywords
         important_keywords = self.config.get('IMPORTANCE', 'important_keywords', '').split(',')
         for keyword in important_keywords:
             if keyword.strip() in text:
                 score += 0.3
                 break
-        
+
         # Check for deadline mentions
         deadline_patterns = [r'deadline', r'due date', r'by \d+', r'before \d+']
         for pattern in deadline_patterns:
             if re.search(pattern, text):
                 score += 0.2
                 break
-        
+
         return min(score, 1.0)
-    
+
     def _calculate_recency_score(self, date: datetime) -> float:
         """Calculate recency score"""
         try:
             dnorm = _normalize_datetime(date)
-            days_old = (datetime.utcnow() - dnorm).days
+            if dnorm is None:
+                return 0.1  # Default score for missing dates
+            # Use timezone-aware UTC now (Python 3.12+ compatible)
+            from datetime import timezone
+            days_old = (datetime.now(timezone.utc).replace(tzinfo=None) - dnorm).days
         except Exception:
             days_old = 999
-        
+
         if days_old <= 1:
             return 1.0
         elif days_old <= 7:
@@ -1140,38 +1312,41 @@ class ImportanceScorer:
             return 0.3
         else:
             return 0.1
-    
+
     def _calculate_relevance_score(self, email: EmailMessage) -> float:
         """Calculate personal relevance score"""
         score = 0.5
-        
+
         # Direct recipient (not CC or BCC)
         if email.recipient and '@' in email.recipient:
             if ',' not in email.recipient:  # Single recipient
                 score += 0.3
-        
+
         # Work category emails during work hours
-        if email.category == 'work':
-            hour = email.date.hour
-            if 9 <= hour <= 17:  # Work hours
-                score += 0.2
-        
+        if email.category == 'work' and email.date:
+            try:
+                hour = email.date.hour
+                if 9 <= hour <= 17:  # Work hours
+                    score += 0.2
+            except (AttributeError, ValueError) as e:
+                logger.debug(f"Could not calculate relevance score for email: {e}")
+
         return min(score, 1.0)
-    
+
     def update_sender_scores(self, emails: List[EmailMessage]):
         """Update sender frequency scores"""
         sender_counts = Counter((email.sender_email or email.sender) for email in emails)
         total_emails = len(emails)
-        
+
         for sender, count in sender_counts.items():
             self.sender_scores[sender] = count / total_emails
 
 class PatternDetector:
     """Detect patterns in email data"""
-    
+
     def __init__(self):
         self.patterns = {}
-    
+
     def analyze_patterns(self, emails: List[EmailMessage]) -> Dict[str, Any]:
         """Analyze various patterns in emails"""
         self.patterns = {
@@ -1183,109 +1358,166 @@ class PatternDetector:
             'communication_patterns': self._analyze_communication_patterns(emails)
         }
         return self.patterns
-    
+
     def _analyze_sender_patterns(self, emails: List[EmailMessage]) -> Dict:
-        """Analyze sender behavior patterns"""
+        """Analyze sender behavior patterns with improved error handling"""
+        if not emails:
+            return {
+                'top_senders': [],
+                'sender_categories': {},
+                'sender_frequency': {}
+            }
+        
         sender_data = defaultdict(lambda: {'count': 0, 'dates': [], 'categories': [], 'label': ''})
-        
+
         for email in emails:
-            key = getattr(email, 'sender_email', '') or email.sender
-            ent = sender_data[key]
-            ent['count'] += 1
-            ent['dates'].append(email.date)
-            ent['categories'].append(email.category)
-            if not ent['label']:
-                ent['label'] = email.sender
-        
+            try:
+                key = getattr(email, 'sender_email', '') or email.sender or 'unknown'
+                ent = sender_data[key]
+                ent['count'] += 1
+                if email.date:
+                    ent['dates'].append(email.date)
+                if email.category:
+                    ent['categories'].append(email.category)
+                if not ent['label'] and email.sender:
+                    ent['label'] = email.sender
+            except Exception as e:
+                logger.debug(f"Error processing sender pattern for email: {e}")
+                continue
+
         # Calculate statistics
+        try:
+            sender_counter = Counter((getattr(e, 'sender_email', '') or e.sender or 'unknown') for e in emails)
+            top_senders = sender_counter.most_common(10)
+        except Exception as e:
+            logger.debug(f"Error calculating top senders: {e}")
+            top_senders = []
+
         patterns = {
-            'top_senders': Counter((getattr(e, 'sender_email', '') or e.sender) for e in emails).most_common(10),
+            'top_senders': top_senders,
             'sender_categories': {},
             'sender_frequency': {}
         }
-        
+
         for sender, data in sender_data.items():
-            if data['count'] >= 5:  # Only analyze frequent senders
-                patterns['sender_categories'][sender] = Counter(data['categories']).most_common(1)[0][0]
-                
-                # Calculate average time between emails
-                if len(data['dates']) > 1:
-                    sorted_dates = sorted((_normalize_datetime(d) for d in data['dates'] if d))
-                    deltas = [(sorted_dates[i+1] - sorted_dates[i]).days 
-                             for i in range(len(sorted_dates)-1)]
-                    avg_days = sum(deltas) / len(deltas) if deltas else 0
-                    patterns['sender_frequency'][sender] = avg_days
-        
+            try:
+                if data['count'] >= 5:  # Only analyze frequent senders
+                    if data['categories']:
+                        patterns['sender_categories'][sender] = Counter(data['categories']).most_common(1)[0][0]
+
+                    # Calculate average time between emails
+                    if len(data['dates']) > 1:
+                        sorted_dates = sorted((_normalize_datetime(d) for d in data['dates'] if d))
+                        if len(sorted_dates) > 1:
+                            deltas = [(sorted_dates[i+1] - sorted_dates[i]).days 
+                                     for i in range(len(sorted_dates)-1)]
+                            avg_days = sum(deltas) / len(deltas) if deltas else 0
+                            patterns['sender_frequency'][sender] = avg_days
+            except Exception as e:
+                logger.debug(f"Error calculating sender pattern for {sender}: {e}")
+                continue
+
         return patterns
-    
+
     def _analyze_time_patterns(self, emails: List[EmailMessage]) -> Dict:
-        """Analyze time-based patterns"""
-        hour_counts = Counter(email.date.hour for email in emails)
-        day_counts = Counter(email.date.strftime('%A') for email in emails)
-        month_counts = Counter(email.date.month for email in emails)
+        """Analyze time-based patterns with improved error handling for missing dates"""
+        if not emails:
+            return {
+                'peak_hours': [],
+                'peak_days': [],
+                'monthly_distribution': {},
+                'hour_distribution': {},
+                'day_distribution': {}
+            }
         
-        return {
-            'peak_hours': hour_counts.most_common(3),
-            'peak_days': day_counts.most_common(3),
-            'monthly_distribution': dict(month_counts),
-            'hour_distribution': dict(hour_counts),
-            'day_distribution': dict(day_counts)
-        }
-    
+        # Filter out emails with None dates
+        emails_with_dates = [e for e in emails if e.date]
+        
+        if not emails_with_dates:
+            return {
+                'peak_hours': [],
+                'peak_days': [],
+                'monthly_distribution': {},
+                'hour_distribution': {},
+                'day_distribution': {}
+            }
+        
+        try:
+            hour_counts = Counter(e.date.hour for e in emails_with_dates)
+            day_counts = Counter(e.date.strftime('%A') for e in emails_with_dates)
+            month_counts = Counter(e.date.month for e in emails_with_dates)
+
+            return {
+                'peak_hours': hour_counts.most_common(3),
+                'peak_days': day_counts.most_common(3),
+                'monthly_distribution': dict(month_counts),
+                'hour_distribution': dict(hour_counts),
+                'day_distribution': dict(day_counts)
+            }
+        except Exception as e:
+            logger.debug(f"Error analyzing time patterns: {e}")
+            return {
+                'peak_hours': [],
+                'peak_days': [],
+                'monthly_distribution': {},
+                'hour_distribution': {},
+                'day_distribution': {}
+            }
+
     def _analyze_subject_patterns(self, emails: List[EmailMessage]) -> Dict:
         """Analyze subject line patterns"""
         subjects = [email.subject for email in emails if email.subject]
-        
+
         # Common words in subjects
         all_words = []
         stop_words = set(stopwords.words('english'))
-        
+
         for subject in subjects:
             try:
                 words = word_tokenize(subject.lower())
             except Exception:
                 words = subject.lower().split()
             all_words.extend([w for w in words if w.isalpha() and w not in stop_words])
-        
+
         return {
             'common_words': Counter(all_words).most_common(20),
             'avg_subject_length': sum(len(s) for s in subjects) / len(subjects) if subjects else 0,
             'subjects_with_re': sum(1 for s in subjects if s.lower().startswith('re:')) / len(subjects) if subjects else 0
         }
-    
+
     def _analyze_category_distribution(self, emails: List[EmailMessage]) -> Dict:
         """Analyze category distribution"""
         categories = [email.category for email in emails if email.category]
         return dict(Counter(categories))
-    
+
     def _analyze_attachment_patterns(self, emails: List[EmailMessage]) -> Dict:
         """Analyze attachment patterns"""
         emails_with_attachments = [email for email in emails if email.attachments]
-        
+
         if not emails_with_attachments:
             return {'percentage_with_attachments': 0, 'common_types': []}
-        
+
         # Extract file extensions
         extensions = []
         for email in emails_with_attachments:
             for attachment in email.attachments:
                 if '.' in attachment:
                     extensions.append(attachment.split('.')[-1].lower())
-        
+
         return {
             'percentage_with_attachments': len(emails_with_attachments) / len(emails) * 100,
             'common_types': Counter(extensions).most_common(5),
             'avg_attachments_per_email': sum(len(e.attachments) for e in emails_with_attachments) / len(emails_with_attachments)
         }
-    
+
     def _analyze_communication_patterns(self, emails: List[EmailMessage]) -> Dict:
         """Analyze communication patterns"""
         # Response patterns (emails with Re: or Fwd:)
         responses = sum(1 for e in emails if e.subject and ('re:' in e.subject.lower() or 'fwd:' in e.subject.lower()))
-        
+
         # Email length patterns
         lengths = [len(email.body) for email in emails if email.body]
-        
+
         return {
             'response_rate': responses / len(emails) * 100 if emails else 0,
             'avg_email_length': sum(lengths) / len(lengths) if lengths else 0,
@@ -1295,11 +1527,11 @@ class PatternDetector:
 
 class Visualizer:
     """Create visualizations for email analysis"""
-    
+
     def __init__(self, config: Configuration):
         self.config = config
         self.figures = []
-        
+
         # Set style
         style_name = config.get('VISUALIZATION', 'chart_style', 'seaborn')
         try:
@@ -1320,11 +1552,11 @@ class Visualizer:
                 sns.set_palette('Set2')
             except Exception:
                 pass
-    
+
     def create_all_visualizations(self, emails: List[EmailMessage], patterns: Dict[str, Any], output_dir: str = 'visualizations'):
         """Create all visualizations"""
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Create individual visualizations
         self.create_category_distribution(emails, patterns, output_dir)
         self.create_time_analysis(emails, patterns, output_dir)
@@ -1332,37 +1564,37 @@ class Visualizer:
         self.create_importance_distribution(emails, output_dir)
         self.create_word_cloud(emails, output_dir)
         self.create_interactive_dashboard(emails, patterns, output_dir)
-        
+
         logger.info(f"All visualizations saved to {output_dir}")
-    
+
     def create_category_distribution(self, emails: List[EmailMessage], patterns: Dict, output_dir: str):
         """Create category distribution pie chart"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
+
         # Pie chart
         categories = patterns['category_distribution']
         if categories:
             colors = sns.color_palette('Set2', len(categories))
             wedges, texts, autotexts = ax1.pie(
-                categories.values(), 
-                labels=categories.keys(), 
+                categories.values(),
+                labels=categories.keys(),
                 autopct='%1.1f%%',
                 colors=colors,
                 startangle=90
             )
             ax1.set_title('Email Category Distribution', fontsize=14, fontweight='bold')
-            
+
             # Bar chart
             ax2.bar(categories.keys(), categories.values(), color=colors)
             ax2.set_xlabel('Category', fontsize=12)
             ax2.set_ylabel('Count', fontsize=12)
             ax2.set_title('Email Count by Category', fontsize=14, fontweight='bold')
             ax2.tick_params(axis='x', rotation=45)
-        
+
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'category_distribution.png'), dpi=300, bbox_inches='tight')
         plt.close()
-    
+
     def create_time_analysis(self, emails: List[EmailMessage], patterns: Dict, output_dir: str):
         """Create time-based analysis charts"""
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
@@ -1423,7 +1655,7 @@ class Visualizer:
         plt.savefig(filepath, dpi=150, bbox_inches='tight')
         plt.close()
         logger.info(f"Analysis chart saved to {filepath}")
-    
+
     def create_word_cloud(self, emails: List[EmailMessage], output_dir: str):
         """Generate word cloud from email subjects"""
         try:
@@ -1508,12 +1740,12 @@ class Visualizer:
 
 class ReportGenerator:
     """Generate comprehensive email analysis reports"""
-    
+
     def __init__(self, output_dir: str = "email_reports", config: Optional[Configuration] = None):
         self.output_dir = output_dir
         self.config = config
         os.makedirs(output_dir, exist_ok=True)
-    
+
     def generate_text_report(self, emails: List[EmailMessage], patterns: Dict[str, Any]) -> str:
         """Generate detailed text report"""
         report = []
@@ -1522,25 +1754,25 @@ class ReportGenerator:
         report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report.append("=" * 80)
         report.append("")
-        
+
         # Summary statistics
         report.append("SUMMARY STATISTICS")
         report.append("-" * 40)
         report.append(f"Total emails analyzed: {len(emails)}")
-        
+
         if emails:
             dates_norm = [_normalize_datetime(e.date) for e in emails if e.date]
             if dates_norm:
                 date_range = f"{min(dates_norm).date()} to {max(dates_norm).date()}"
                 report.append(f"Date range: {date_range}")
-            
+
             # Category breakdown
             category_counts = Counter([e.category for e in emails])
             report.append("\nCategory Breakdown:")
             for category, count in category_counts.most_common():
                 percentage = (count / len(emails)) * 100
                 report.append(f"  - {category}: {count} ({percentage:.1f}%)")
-            
+
             # Importance analysis (importance_score is 0-1)
             try:
                 imp_thresh = float(self.config.get('IMPORTANCE', 'important_threshold', '0.6')) if self.config else 0.6
@@ -1548,13 +1780,13 @@ class ReportGenerator:
                 imp_thresh = 0.6
             important_emails = [e for e in emails if getattr(e, 'importance_score', 0.0) >= imp_thresh]
             report.append(f"\nImportant emails (score >= {imp_thresh}): {len(important_emails)}")
-            
+
             # Top important emails
             if important_emails:
                 report.append("\nTop 5 Most Important Emails:")
                 for email in sorted(important_emails, key=lambda x: x.importance_score, reverse=True)[:5]:
                     report.append(f"  - [{email.importance_score}] {email.subject[:50]} (from: {email.sender[:30]})")
-        
+
         # Pattern insights
         if patterns:
             report.append("\n" + "=" * 40)
@@ -1578,7 +1810,7 @@ class ReportGenerator:
                 common = patterns['subject_patterns'].get('common_words', [])
                 for word, count in common[:15]:
                     report.append(f"  - '{word}': {count} occurrences")
-        
+
         # Recommendations
         report.append("\n" + "=" * 40)
         report.append("RECOMMENDATIONS")
@@ -1587,7 +1819,8 @@ class ReportGenerator:
         if emails:
             old_emails = []
             try:
-                now_utc_naive = datetime.utcnow()
+                from datetime import timezone
+                now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
                 for e in emails:
                     d = _normalize_datetime(e.date)
                     if d and (now_utc_naive - d).days > 180:
@@ -1604,37 +1837,38 @@ class ReportGenerator:
             newsletter_count = len([e for e in emails if e.category and e.category.lower() == 'newsletter'])
             if newsletter_count > len(emails) * 0.3:
                 report.append(f"- High newsletter volume ({newsletter_count}). Consider unsubscribing from unused lists")
-        
+
         report_text = "\n".join(report)
-        
+
         # Save to file
         filepath = os.path.join(self.output_dir, f"email_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(report_text)
-        
+
         logger.info(f"Text report saved to {filepath}")
         return report_text
-    
+
     def export_to_csv(self, emails: List[EmailMessage]):
-        """Export email data to CSV for further analysis"""
+        """Export email data to CSV for further analysis with CSV injection protection."""
         filepath = os.path.join(self.output_dir, f"email_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-        
+
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['date', 'sender', 'sender_email', 'subject', 'category', 'importance_score', 'has_attachments']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+
             writer.writeheader()
             for email in emails:
+                # Sanitize fields to prevent CSV injection
                 writer.writerow({
-                    'date': email.date.isoformat(),
-                    'sender': email.sender,
-                    'sender_email': getattr(email, 'sender_email', ''),
-                    'subject': email.subject,
-                    'category': email.category,
+                    'date': email.date.isoformat() if email.date else '',
+                    'sender': SecurityUtils.sanitize_for_csv(email.sender),
+                    'sender_email': SecurityUtils.sanitize_for_csv(getattr(email, 'sender_email', '')),
+                    'subject': SecurityUtils.sanitize_for_csv(email.subject),
+                    'category': SecurityUtils.sanitize_for_csv(email.category or ''),
                     'importance_score': email.importance_score,
                     'has_attachments': bool(email.attachments)
                 })
-        
+
         logger.info(f"CSV export saved to {filepath}")
 
     def export_actionable_senders(self, emails: List[EmailMessage], patterns: Dict[str, Any]):
@@ -1694,20 +1928,33 @@ class ReportGenerator:
             if avg_importance >= IMPORTANT_AVG_IMPORTANCE or any(k in sender.lower() for k in ('ceo', 'hr@', 'boss', 'manager')):
                 important_senders.append({'sender': sender, 'count': count, 'avg_importance': avg_importance})
 
-        # Write CSVs
+        # Write CSVs with CSV injection protection
         del_path = os.path.join(self.output_dir, 'senders_to_delete.csv')
         with open(del_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance', 'newsletter_pct'])
             writer.writeheader()
             for row in sorted(senders_to_delete, key=lambda r: (-r['count'], r['avg_importance'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance'],
+                    'newsletter_pct': row['newsletter_pct']
+                }
+                writer.writerow(sanitized_row)
 
         imp_path = os.path.join(self.output_dir, 'important_senders.csv')
         with open(imp_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=['sender', 'count', 'avg_importance'])
             writer.writeheader()
             for row in sorted(important_senders, key=lambda r: (-r['avg_importance'], -r['count'])):
-                writer.writerow(row)
+                # Sanitize sender field to prevent CSV injection
+                sanitized_row = {
+                    'sender': SecurityUtils.sanitize_for_csv(row['sender']),
+                    'count': row['count'],
+                    'avg_importance': row['avg_importance']
+                }
+                writer.writerow(sanitized_row)
 
         logger.info(f"Senders to delete saved to {del_path}")
         logger.info(f"Important senders saved to {imp_path}")
@@ -1743,7 +1990,10 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow(['sender_key', 'sender_label', 'total_emails', 'important_emails'])
             for sender, v in sorted(counts.items(), key=lambda kv: (-kv[1]['total'], -kv[1]['important'])):
-                writer.writerow([sender, v['label'] or sender, v['total'], v['important']])
+                # Sanitize sender fields to prevent CSV injection
+                sanitized_sender = SecurityUtils.sanitize_for_csv(sender)
+                sanitized_label = SecurityUtils.sanitize_for_csv(v['label'] or sender)
+                writer.writerow([sanitized_sender, sanitized_label, v['total'], v['important']])
         logger.info(f"Sender stats saved to {out_path}")
         return out_path
 
@@ -1758,11 +2008,11 @@ def main():
         'max_emails': int(os.getenv('MAX_EMAILS', '1000')),
         'output_dir': os.getenv('OUTPUT_DIR', 'email_analysis_output')
     }
-    
+
     print("\n" + "=" * 60)
     print("EMAIL ANALYSIS TOOL")
     print("=" * 60)
-    
+
     # Create output directory
     os.makedirs(config['output_dir'], exist_ok=True)
     # Build Configuration object for classes that expect it
@@ -1798,7 +2048,7 @@ def main():
     force_full = os.getenv('FORCE_FULL_FETCH')
     if (lf_env and str(lf_env).lower() in ('0', 'false', 'no')) or (force_full and str(force_full).lower() in ('1','true','yes','on')):
         cfg.config['EMAIL']['light_fetch'] = '0'
-    
+
     try:
         # Initialize components
         print("\n[1/7] Initializing email connector...")
@@ -1904,13 +2154,20 @@ def main():
 
         emails = []
         # Fetch bodies with optional parallelism. IMAP connection is not thread-safe; default to serial.
+        # Validate batch_size to prevent memory exhaustion
         try:
             batch_size_val = int(connector.config.get('EMAIL', 'batch_size', '100'))
+            if batch_size_val < 1 or batch_size_val > MAX_BATCH_SIZE:
+                logger.warning(f"Invalid batch_size {batch_size_val}, using default 100")
+                batch_size_val = 100
         except Exception:
             batch_size_val = 100
         # Determine workers from env, default 1 (serial)
         try:
             env_workers = int(os.getenv('FETCH_WORKERS', '1'))
+            if env_workers < 1 or env_workers > 8:
+                logger.warning(f"Invalid FETCH_WORKERS {env_workers}, using default 1")
+                env_workers = 1
         except Exception:
             env_workers = 1
         max_workers = max(1, min(env_workers, 8))
@@ -1938,11 +2195,11 @@ def main():
         t_fetch = time.time() - t_fetch_start
         logger.info(f"Body fetch completed in {t_fetch:.3f}s")
         print(f"    Retrieved {len(emails)} emails")
-        
+
         if not emails:
             print("\nNo emails found to analyze.")
             return
-        
+
         # Process emails
         print("[4/7] Processing and categorizing emails...")
         categorizer = EmailCategorizer(cfg)
@@ -1955,12 +2212,12 @@ def main():
         scorer.update_sender_scores(categorized_emails)
         for e in categorized_emails:
             scorer.calculate_importance(e, categorized_emails)
-        
+
         # Detect patterns
         print("[5/7] Detecting patterns...")
         pattern_detector = PatternDetector()
         patterns = pattern_detector.analyze_patterns(categorized_emails)
-        
+
         # Generate visualizations (disabled by default)
         vis_enabled = os.getenv('VIS_ENABLED', cfg.get('VISUALIZATION', 'enabled', '0'))
         if str(vis_enabled).lower() in ('1', 'true', 'yes', 'on'):
@@ -2015,7 +2272,7 @@ def main():
                 for e in emails:
                     writer.writerow([e.uid, e.date.isoformat() if e.date else '', e.sender, e.subject, ','.join(e.headers.get('Flags', [])) if e.headers else '', e.size])
             logger.info(f"Header summary saved to {hdr_path}")
-        
+
         # Print summary to console
         print("\n" + "=" * 60)
         print("ANALYSIS COMPLETE")
@@ -2028,7 +2285,7 @@ def main():
         print("  - senders_to_delete.csv (suggested senders to consider unsubscribing/deleting)")
         print("  - important_senders.csv (senders marked as important)")
         print("  - summary.json (quick actionable summary)")
-        
+
         # Show quick stats
         print(f"\nQuick Statistics:")
         print(f"  - Total emails: {len(categorized_emails)}")
@@ -2046,7 +2303,7 @@ def main():
             imp = sum(1 for e in categorized_emails if (getattr(e, 'sender_email', '') or e.sender) == sender_key and getattr(e, 'importance_score', 0.0) >= imp_thresh)
             label = label_map.get(sender_key, sender_key)
             print(f"      {label[:60]:60} | total={cnt:4} | important={imp:4}")
-        
+
     except Exception as e:
         logger.error(f"Error during analysis: {str(e)}")
         print(f"\nError: {str(e)}")
@@ -2055,7 +2312,7 @@ def main():
         print("  2. For Gmail, use an app-specific password")
         print("  3. Ensure IMAP is enabled in your email settings")
         print("  4. Check your internet connection")
-    
+
     finally:
         try:
             connector.disconnect()
@@ -2065,7 +2322,7 @@ def main():
 if __name__ == "__main__" and not os.getenv('PYTEST_RUNNING'):
     # Setup argument parser for command-line usage
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Analyze and organize your email inbox')
     parser.add_argument('--email', help='Email address', default=None)
     parser.add_argument('--server', help='IMAP server address', default=None)
@@ -2075,9 +2332,9 @@ if __name__ == "__main__" and not os.getenv('PYTEST_RUNNING'):
     parser.add_argument('--gmail-categories', help='Comma-separated Gmail categories to search (Primary,Social,Promotions,Updates)', default=None)
     parser.add_argument('--output-dir', default=None, help='Output directory')
     parser.add_argument('--fast-mode', action='store_true', help='Header-only fetch; write small header report and skip full body processing')
-    
+
     args = parser.parse_args()
-    
+
     # Override config with command-line arguments if provided
     if args.email is not None:
         os.environ['EMAIL_ADDRESS'] = args.email
@@ -2095,5 +2352,5 @@ if __name__ == "__main__" and not os.getenv('PYTEST_RUNNING'):
         os.environ['GMAIL_CATEGORIES'] = args.gmail_categories
     if args.fast_mode:
         os.environ['FAST_MODE'] = '1'
-    
+
     main()

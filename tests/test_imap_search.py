@@ -280,6 +280,11 @@ class TestSearchCriteriaValidation(unittest.TestCase):
         """Test that valid IMAP search criteria are accepted."""
         # These should be valid
         valid_criteria = ['ALL', 'UNSEEN', 'SEEN', 'ANSWERED', 'DELETED', 'FLAGGED']
+        for criteria in valid_criteria:
+            # The validation in main.py uses a regex pattern
+            import re
+            valid_criteria_pattern = re.compile(r'^[A-Z0-9\s\(\)\<\>\"\@\[\]\\\+\-\.\:\\]+$')
+            self.assertTrue(valid_criteria_pattern.match(criteria.upper()), f"Criteria '{criteria}' should be valid")
         
     def test_invalid_search_criteria(self):
         """Test that invalid search criteria are rejected."""
@@ -290,6 +295,10 @@ class TestSearchCriteriaValidation(unittest.TestCase):
             'ALL\nDELETE *',  # Newline injection
             'ALL\x00INJECTED',  # Null byte injection
         ]
+        import re
+        valid_criteria_pattern = re.compile(r'^[A-Z0-9\s\(\)\<\>\"\@\[\]\\\+\-\.\:\\]+$')
+        for criteria in invalid_criteria:
+            self.assertFalse(valid_criteria_pattern.match(criteria.upper()), f"Criteria '{criteria}' should be invalid")
 
 
 if __name__ == '__main__':

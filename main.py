@@ -972,8 +972,15 @@ class EmailConnector:
         if not msg:
             return ""
 
+        # Safely check if message is multipart - handle exceptions
         try:
-            if msg.is_multipart():
+            is_multipart = msg.is_multipart()
+        except Exception as e:
+            logger.debug(f"Error checking multipart status: {e}")
+            is_multipart = False
+
+        try:
+            if is_multipart:
                 # Track if we found any valid parts
                 found_valid_part = False
                 for part in msg.walk():
@@ -1096,9 +1103,20 @@ class EmailCategorizer:
     def __init__(self, config: Configuration):
         self.config = config
         self.categories = ['promotional', 'work', 'personal', 'newsletter', 'spam', 'other']
-        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-        self.classifier = MultinomialNB()
+        self.vectorizer = None
+        self.classifier = None
         self.pipeline = None
+        
+        # Only initialize ML components if sklearn is available
+        if SKLEARN_AVAILABLE and TfidfVectorizer is not None and MultinomialNB is not None:
+            try:
+                self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+                self.classifier = MultinomialNB()
+            except Exception as e:
+                logger.debug(f"Failed to initialize ML components: {e}")
+                self.vectorizer = None
+                self.classifier = None
+        
         try:
             self.sia = SentimentIntensityAnalyzer()
         except Exception:
@@ -1106,6 +1124,11 @@ class EmailCategorizer:
 
     def train_classifier(self, emails: List[EmailMessage]):
         """Train the email classifier"""
+        # Skip training if ML components are not available
+        if not SKLEARN_AVAILABLE or self.vectorizer is None or self.classifier is None:
+            logger.debug("ML classifier not available, skipping training")
+            return
+            
         # Create training data based on keywords
         training_data = []
         training_labels = []
@@ -1273,7 +1296,9 @@ class ImportanceScorer:
             dnorm = _normalize_datetime(date)
             if dnorm is None:
                 return 0.1  # Default score for missing dates
-            days_old = (datetime.utcnow() - dnorm).days
+            # Use timezone-aware UTC now (Python 3.12+ compatible)
+            from datetime import timezone
+            days_old = (datetime.now(timezone.utc).replace(tzinfo=None) - dnorm).days
         except Exception:
             days_old = 999
 
@@ -1794,7 +1819,8 @@ class ReportGenerator:
         if emails:
             old_emails = []
             try:
-                now_utc_naive = datetime.utcnow()
+                from datetime import timezone
+                now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
                 for e in emails:
                     d = _normalize_datetime(e.date)
                     if d and (now_utc_naive - d).days > 180:

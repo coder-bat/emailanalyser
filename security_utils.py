@@ -179,12 +179,15 @@ class SecurityUtils:
         """
         Validate categories parameter to prevent injection.
         Only allows alphanumeric, comma, space, and hyphen.
-        Rejects newlines and other control characters.
+        Rejects newlines, semicolons, and other control characters.
         """
         if not categories:
             return True  # Empty is valid
-        # Check for newlines and other dangerous characters
+        # Check for newlines, semicolons and other dangerous characters
         if '\n' in categories or '\r' in categories or '\t' in categories:
+            return False
+        # Reject semicolons which could be used for command injection
+        if ';' in categories:
             return False
         return bool(re.match(r'^[a-zA-Z0-9,\s\-]+$', categories))
     

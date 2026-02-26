@@ -451,6 +451,11 @@ class EmailConnector:
         """
         if not ids:
             return []
+        
+        # Ensure connection exists before attempting fetch operations
+        if not self.connection:
+            logger.warning("No IMAP connection available in ensure_uids, returning IDs as-is")
+            return ids
 
         # Deduplicate while preserving order
         seen = set()
@@ -1004,7 +1009,8 @@ class EmailConnector:
                                 if payload:
                                     html_body = payload.decode('utf-8', errors='ignore')
                                     # Simple HTML to text conversion
-                                    text = re.sub('<[^\u003c]+?\u003e', '', html_body)
+                                    # Fix: Use proper regex pattern to remove HTML tags
+                                    text = re.sub(r'<[^>]+>', '', html_body)
                                     if text.strip():
                                         body_parts.append(text)
                                         found_valid_part = True
@@ -2175,10 +2181,21 @@ def main():
             try:
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = [ex.submit(connector.fetch_email, uid) for uid in uids_to_fetch[:effective_max]]
-                    for f in as_completed(futures):
+                    # Add timeout to prevent indefinite hangs on network issues
+                    for f in as_completed(futures, timeout=300):  # 5 minute timeout
                         em = f.result()
                         if em:
                             emails.append(em)
+            except TimeoutError:
+                logger.warning("Parallel fetch timed out after 5 minutes, falling back to serial fetch")
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
+                # fallback to serial fetch for remaining
+                for i, eid in enumerate(uids_to_fetch[len(emails):effective_max]):
+                    em = connector.fetch_email(eid)
+                    if em:
+                        emails.append(em)
             except Exception:
                 # fallback to serial fetch
                 for i, eid in enumerate(uids_to_fetch[:effective_max]):
@@ -2260,18 +2277,6 @@ def main():
             print(f"Summary JSON: {sum_path}")
         except Exception as e:
             logger.error(f"Failed to export actionable senders: {e}")
-
-        # If fast mode requested, also write a header-only CSV and small summary
-        fast_mode = os.getenv('FAST_MODE', '0') == '1' or os.getenv('FAST_MODE', '').lower() in ('true', '1')
-        if fast_mode:
-            hdr_path = os.path.join(config['output_dir'], 'header_summary.csv')
-            with open(hdr_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['uid', 'date', 'from', 'subject', 'flags', 'size'])
-                # headers_map keys may be sequence numbers; write values for the uids we fetched
-                for e in emails:
-                    writer.writerow([e.uid, e.date.isoformat() if e.date else '', e.sender, e.subject, ','.join(e.headers.get('Flags', [])) if e.headers else '', e.size])
-            logger.info(f"Header summary saved to {hdr_path}")
 
         # Print summary to console
         print("\n" + "=" * 60)

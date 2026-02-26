@@ -58,14 +58,13 @@ jobs = {}
 job_access_times = {}  # Track last access time for TTL cleanup
 
 def _sanitize_env_value(value):
-    """Sanitize environment variable values to prevent command injection."""
-    if value is None:
-        return ''
-    value = str(value)
-    # Remove null bytes and control characters
-    value = re.sub(r'[\x00-\x1f\x7f]', '', value)
-    # Limit length to prevent DoS
-    return value[:4096]
+    """Sanitize environment variable values to prevent command injection.
+    
+    DEPRECATED: Use SecurityUtils.sanitize_env_value() instead for consistent
+    security handling across the codebase.
+    """
+    # Delegate to SecurityUtils for consistent validation
+    return SecurityUtils.sanitize_env_value(value)
 
 def _validate_email(email):
     """Basic email validation."""
@@ -157,7 +156,7 @@ def _run_analysis_job(job_id: str, params: dict):
                 jobs[job_id]['error'] = 'Invalid email address format'
                 jobs[job_id]['updated_at'] = time.time()
             return
-        env['EMAIL_ADDRESS'] = _sanitize_env_value(params['email'])
+        env['EMAIL_ADDRESS'] = SecurityUtils.sanitize_env_value(params['email'])
     
     # Validate max_emails with upper bound check
     is_valid, max_emails = SecurityUtils.validate_max_emails(params.get('max_emails', 1000))
@@ -179,8 +178,10 @@ def _run_analysis_job(job_id: str, params: dict):
     if params.get('password'):
         # Password is passed securely via env var, limited length
         password = params['password']
+        # Additional validation: check password length before sanitization
         if len(password) > SecurityUtils.MAX_PASSWORD_LENGTH:
             logger.warning(f"Password exceeds max length, truncating to {SecurityUtils.MAX_PASSWORD_LENGTH} chars")
+        # Use SecurityUtils for consistent sanitization
         env['EMAIL_PASSWORD'] = SecurityUtils.sanitize_password(password)
     
     try:

@@ -177,6 +177,7 @@ class TestSecurityUtils(unittest.TestCase):
         
         self.assertFalse(SecurityUtils.validate_categories('Primary;Social'))
         self.assertFalse(SecurityUtils.validate_categories('Primary\nSocial'))
+        self.assertFalse(SecurityUtils.validate_categories('Primary\tSocial'))
 
 
 class TestSecureFilePath(unittest.TestCase):

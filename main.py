@@ -1016,7 +1016,8 @@ class EmailConnector:
                                         found_valid_part = True
                             except (UnicodeDecodeError, AttributeError) as e:
                                 logger.debug(f"Body extraction error (html): {e}")
-                    except Exception as e:
+                    except (ValueError, TypeError, KeyError) as e:
+                        # Catch specific exceptions for message part processing
                         logger.debug(f"Error processing message part: {e}")
                         continue
 
@@ -1026,7 +1027,7 @@ class EmailConnector:
                         payload = msg.get_payload(decode=True)
                         if payload:
                             return payload.decode('utf-8', errors='ignore')
-                    except Exception as e:
+                    except (UnicodeDecodeError, AttributeError) as e:
                         logger.debug(f"Fallback body extraction error: {e}")
             else:
                 try:
@@ -1036,14 +1037,15 @@ class EmailConnector:
                         body_parts.append(body)
                 except (UnicodeDecodeError, AttributeError) as e:
                     logger.debug(f"Body extraction error (single): {e}")
-        except Exception as e:
+        except (ValueError, TypeError) as e:
+            # Catch specific exceptions instead of bare except
             logger.debug(f"Error in _extract_body: {e}")
             # Final fallback: try to get string payload
             try:
                 payload = msg.get_payload()
                 if isinstance(payload, str):
                     return payload
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
 
         return '\n'.join(body_parts)
@@ -1052,13 +1054,26 @@ class EmailConnector:
         """Extract attachment filenames"""
         attachments = []
 
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_disposition = str(part.get("Content-Disposition", ""))
-                if "attachment" in content_disposition:
-                    filename = part.get_filename()
-                    if filename:
-                        attachments.append(self._decode_header(filename))
+        try:
+            is_multipart = msg.is_multipart()
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.debug(f"Error checking multipart in _extract_attachments: {e}")
+            is_multipart = False
+
+        if is_multipart:
+            try:
+                for part in msg.walk():
+                    try:
+                        content_disposition = str(part.get("Content-Disposition", ""))
+                        if "attachment" in content_disposition:
+                            filename = part.get_filename()
+                            if filename:
+                                attachments.append(self._decode_header(filename))
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logger.debug(f"Error extracting attachment from part: {e}")
+                        continue
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Error walking message parts: {e}")
 
         return attachments
 
@@ -1069,7 +1084,8 @@ class EmailConnector:
         """
         try:
             from email.utils import parseaddr
-        except Exception:
+        except (ImportError, ValueError) as e:
+            logger.debug(f"Could not import parseaddr: {e}")
             parseaddr = None
         if not msg:
             return ''
@@ -2178,6 +2194,7 @@ def main():
             env_workers = 1
         max_workers = max(1, min(env_workers, 8))
         if max_workers > 1:
+            futures = []
             try:
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = [ex.submit(connector.fetch_email, uid) for uid in uids_to_fetch[:effective_max]]
@@ -2196,12 +2213,22 @@ def main():
                     em = connector.fetch_email(eid)
                     if em:
                         emails.append(em)
-            except Exception:
+            except (ValueError, TypeError, RuntimeError) as e:
+                # Handle specific exceptions, not bare Exception
+                logger.warning(f"Parallel fetch failed with {type(e).__name__}: {e}, falling back to serial fetch")
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
                 # fallback to serial fetch
-                for i, eid in enumerate(uids_to_fetch[:effective_max]):
+                for i, eid in enumerate(uids_to_fetch[len(emails):effective_max]):
                     em = connector.fetch_email(eid)
                     if em:
                         emails.append(em)
+            finally:
+                # Ensure all futures are cancelled to prevent memory leaks
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
         else:
             # Serial fetch
             for i, eid in enumerate(uids_to_fetch[:effective_max]):
@@ -2309,7 +2336,7 @@ def main():
             label = label_map.get(sender_key, sender_key)
             print(f"      {label[:60]:60} | total={cnt:4} | important={imp:4}")
 
-    except Exception as e:
+    except (OSError, IOError, ValueError, TypeError) as e:
         logger.error(f"Error during analysis: {str(e)}")
         print(f"\nError: {str(e)}")
         print("\nTroubleshooting tips:")
@@ -2319,9 +2346,12 @@ def main():
         print("  4. Check your internet connection")
 
     finally:
+        # Ensure connector exists before trying to disconnect
         try:
-            connector.disconnect()
-        except:
+            if 'connector' in locals() and connector is not None:
+                connector.disconnect()
+        except (OSError, IOError, AttributeError):
+            # Ignore disconnect errors - connection may already be closed
             pass
 
 if __name__ == "__main__" and not os.getenv('PYTEST_RUNNING'):

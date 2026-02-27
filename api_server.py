@@ -83,7 +83,10 @@ def _validate_positive_int(value, default=None):
         return default
 
 def _cleanup_old_jobs():
-    """Clean up old completed/failed jobs to prevent memory leaks using TTL."""
+    """Clean up old completed/failed jobs to prevent memory leaks using TTL.
+    
+    This function is thread-safe and handles edge cases like missing timestamps.
+    """
     with jobs_lock:
         current_time = time.time()
         jobs_to_remove = []
@@ -93,14 +96,21 @@ def _cleanup_old_jobs():
             status = job_info.get('status')
             updated_at = job_info.get('updated_at', 0)
             
+            # Skip jobs without valid timestamps to prevent accidental deletion
+            if not isinstance(updated_at, (int, float)) or updated_at <= 0:
+                continue
+                
             if status in ('completed', 'failed'):
                 if current_time - updated_at > JOB_TTL_SECONDS:
                     jobs_to_remove.append(job_id)
         
         # Also enforce MAX_JOBS limit if needed
         if len(jobs) > MAX_JOBS:
-            # Sort by last update time
-            sorted_jobs = sorted(jobs.items(), key=lambda x: x[1].get('updated_at', 0))
+            # Sort by last update time, oldest first
+            sorted_jobs = sorted(
+                jobs.items(), 
+                key=lambda x: x[1].get('updated_at', 0) if isinstance(x[1].get('updated_at'), (int, float)) else 0
+            )
             # Remove oldest jobs that are completed or failed
             for job_id, job_info in sorted_jobs:
                 if job_info.get('status') in ('completed', 'failed') and job_id not in jobs_to_remove:
@@ -281,7 +291,14 @@ def _set_cached_response(cache_key, data):
         response_cache[cache_key] = (data, time.time())
 
 def get_latest_file(pattern):
-    """Find the most recent file matching pattern in output directory"""
+    """Find the most recent file matching pattern in output directory
+    
+    Args:
+        pattern: String pattern to match in filename
+        
+    Returns:
+        Full path to the most recent matching file, or None if not found/invalid
+    """
     # Sanitize pattern to prevent path traversal
     if not pattern or not SecurityUtils.validate_path_pattern(pattern):
         logger.warning(f"Invalid file pattern rejected: {pattern}")
@@ -291,7 +308,13 @@ def get_latest_file(pattern):
         return None
     
     try:
-        files = [f for f in os.listdir(OUTPUT_DIR) if pattern in f]
+        # List files and filter by pattern
+        files = []
+        for f in os.listdir(OUTPUT_DIR):
+            # Additional safety: validate each filename
+            if SecurityUtils.validate_safe_filename(f) and pattern in f:
+                files.append(f)
+        
         if not files:
             return None
         
@@ -299,7 +322,13 @@ def get_latest_file(pattern):
         # Handle potential errors during stat
         def get_mtime_safe(filename):
             try:
-                return os.path.getmtime(os.path.join(OUTPUT_DIR, filename))
+                filepath = os.path.join(OUTPUT_DIR, filename)
+                # Verify the path is still safe after joining
+                filepath_abs = os.path.abspath(filepath)
+                output_abs = os.path.abspath(OUTPUT_DIR)
+                if not filepath_abs.startswith(output_abs + os.sep):
+                    return 0
+                return os.path.getmtime(filepath)
             except (OSError, ValueError) as e:
                 logger.debug(f"Could not get mtime for {filename}: {e}")
                 return 0

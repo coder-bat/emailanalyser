@@ -50,25 +50,27 @@ COPY *.py ./
 COPY --from=frontend-build /app/frontend/build ./frontend/build/
 RUN test -f ./frontend/build/index.html || (echo "ERROR: frontend build missing after copy" && ls -R ./frontend/build || exit 1)
 
-# Create output directory
-RUN mkdir -p email_analysis_output
+# Create output directory with proper permissions
+RUN mkdir -p email_analysis_output && chmod 755 email_analysis_output
 
 # Set environment variables
 ENV PYTHONPATH=/app
 ENV OUTPUT_DIR=/app/email_analysis_output
 ENV API_PORT=5000
 ENV FLASK_ENV=production
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # Expose port
 EXPOSE 5000
 
 # Create non-root user for security
-RUN useradd -m -u 1000 emailuser && chown -R emailuser:emailuser /app
+RUN useradd -m -u 1000 -s /bin/false emailuser && chown -R emailuser:emailuser /app
 USER emailuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
-# Start the API server
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "api_server:app"]
+# Start the API server with single worker for job consistency
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120", "--max-requests", "1000", "--max-requests-jitter", "50", "api_server:app"]

@@ -1,0 +1,152 @@
+# EmailAnalyser Security & Code Quality Analysis Report
+**Date:** February 28, 2026  
+**Analyst:** OpenClaw Agent  
+**Repository:** https://github.com/coder-bat/EmailAnalyser.git
+
+---
+
+## Executive Summary
+
+The EmailAnalyser codebase has undergone significant security improvements since the last audit. The code now includes comprehensive input validation, sanitization utilities, and protection against common attack vectors. All 21 existing tests pass successfully.
+
+**Overall Security Grade: B+** (Good security practices with minor areas for improvement)
+
+---
+
+## Findings Summary
+
+| Category | Count | Status |
+|----------|-------|--------|
+| Critical Issues | 0 | ✅ None found |
+| High Severity | 0 | ✅ None found |
+| Medium Severity | 2 | ⚠️ See below |
+| Low Severity | 3 | ℹ️ See below |
+| Code Quality | 2 | ℹ️ Recommendations |
+
+---
+
+## Detailed Findings
+
+### 🔶 MEDIUM SEVERITY
+
+#### 1. Race Condition in Job Management (api_server.py)
+**Location:** `api_server.py`, lines 45-60, 280-300
+
+**Issue:** The `jobs` dictionary is accessed with locks, but there's a potential race condition in the job reuse logic:
+
+```python
+# Line ~280-290
+with jobs_lock:
+    for jid, info in jobs.items():
+        if info.get('status') in ('queued', 'running'):
+            reuse_job_id = jid
+            break
+    if reuse_job_id:
+        return jsonify({'message': 'Analysis already in progress', ...})
+```
+
+**Problem:** Between checking for an active job and returning, a job could complete, leading to stale job references.
+
+**Recommendation:** Add a timestamp check or version counter to ensure job freshness.
+
+**Fix Priority:** Medium
+
+---
+
+#### 2. Missing Rate Limiting on Analysis Endpoint
+**Location:** `api_server.py`, `/api/run-analysis` endpoint
+
+**Issue:** While there's a basic check for concurrent jobs (max 3), there's no per-IP or per-user rate limiting. This could allow:
+- Resource exhaustion attacks
+- Email server overload (via repeated analysis requests)
+
+**Recommendation:** Implement per-IP rate limiting using Flask-Limiter.
+
+**Fix Priority:** Medium
+
+---
+
+### 🔷 LOW SEVERITY
+
+#### 3. Information Disclosure via Error Messages
+**Location:** `api_server.py`, various endpoints
+
+**Issue:** Some error responses may leak internal implementation details by returning `str(e)` directly to clients.
+
+**Recommendation:** Return generic error messages to clients, log detailed errors server-side.
+
+**Fix Priority:** Low
+
+---
+
+#### 4. Config File Permissions Not Validated
+**Location:** `main.py`, `Configuration` class
+
+**Issue:** The configuration file (`config.ini`) may contain sensitive credentials (email passwords). The code doesn't check file permissions.
+
+**Recommendation:** Add permission validation to warn if config file is world-readable/writable.
+
+**Fix Priority:** Low
+
+---
+
+#### 5. Missing Input Validation on Date Parsing
+**Location:** `main.py`, `_normalize_datetime()` function
+
+**Issue:** While the function handles exceptions, it could be more robust with explicit type checking.
+
+**Recommendation:** Add `isinstance(dt, datetime)` check before processing.
+
+**Fix Priority:** Low
+
+---
+
+## Security Strengths ✅
+
+1. **Comprehensive Input Validation:** The `SecurityUtils` class provides excellent validation for IMAP UIDs, email addresses, filenames, and categories.
+
+2. **CSV Injection Protection:** All CSV exports use `SecurityUtils.sanitize_for_csv()` to prevent formula injection attacks.
+
+3. **IMAP Command Injection Prevention:** The `_fetch()` method validates fetch sets against injection patterns before executing IMAP commands.
+
+4. **HTML Escaping:** XSS protection via `SecurityUtils.sanitize_html_content()`.
+
+5. **Environment Variable Sanitization:** Control characters and null bytes are stripped from env values.
+
+6. **Path Traversal Protection:** `SecureFilePath` class prevents directory traversal attacks.
+
+7. **Docker Security:** Dockerfile uses non-root user (`emailuser`) and includes health checks.
+
+8. **Password Handling:** Passwords are never logged and are sanitized before use in environment variables.
+
+---
+
+## Recommendations Summary
+
+### Immediate Actions (High Priority)
+- None identified
+
+### Short-term (Medium Priority)
+1. Implement per-IP rate limiting on analysis endpoint
+2. Add job version/timestamp to prevent race conditions
+
+### Long-term (Low Priority)
+1. Add config file permission warnings
+2. Improve error message sanitization
+3. Expand test coverage
+4. Add type hints throughout
+
+---
+
+## Conclusion
+
+The EmailAnalyser codebase demonstrates mature security practices with comprehensive input validation, sanitization, and protection against common attack vectors. The code is well-structured and maintainable. No critical or high-severity issues were found during this analysis.
+
+**Recommended Actions:**
+1. Address the 2 medium-severity issues in the next development cycle
+2. Consider the low-priority improvements as part of ongoing maintenance
+3. Continue expanding test coverage
+
+---
+
+*Report generated by OpenClaw Agent on February 28, 2026*

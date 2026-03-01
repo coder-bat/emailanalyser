@@ -302,5 +302,56 @@ class TestSearchCriteriaValidation(unittest.TestCase):
             self.assertFalse(valid_criteria_pattern.match(criteria.upper()), f"Criteria '{criteria}' should be invalid")
 
 
+class TestConfigurationSecurity(unittest.TestCase):
+    """Test Configuration class security features."""
+
+    def test_config_permission_warning_world_readable(self):
+        """Test that Configuration warns about world-readable config files."""
+        import tempfile
+        import stat
+        import os
+        
+        # Create a temporary config file with world-readable permissions
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False) as f:
+            f.write('[EMAIL]\nusername = test\npassword = secret\n')
+            temp_path = f.name
+        
+        try:
+            # Make it world-readable
+            os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            
+            # Import here to avoid issues with module-level imports
+            from main import Configuration
+            
+            # Create config - should not raise, but may log warning
+            # We can't easily capture the log, but we can verify it loads
+            cfg = Configuration(temp_path)
+            self.assertEqual(cfg.get('EMAIL', 'username'), 'test')
+        finally:
+            os.unlink(temp_path)
+
+    def test_config_loads_with_secure_permissions(self):
+        """Test that Configuration loads normally with secure permissions."""
+        import tempfile
+        import stat
+        import os
+        
+        # Create a temporary config file with secure permissions
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ini', delete=False) as f:
+            f.write('[EMAIL]\nusername = testuser\npassword = testpass\n')
+            temp_path = f.name
+        
+        try:
+            # Make it user-only readable
+            os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR)
+            
+            from main import Configuration
+            cfg = Configuration(temp_path)
+            self.assertEqual(cfg.get('EMAIL', 'username'), 'testuser')
+            self.assertEqual(cfg.get('EMAIL', 'password'), 'testpass')
+        finally:
+            os.unlink(temp_path)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -479,7 +479,7 @@ def get_sender_stats():
         return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting sender stats: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to retrieve sender statistics'}), 500
 
 @app.route('/api/senders-to-delete', methods=['GET'])
 def get_senders_to_delete():
@@ -506,7 +506,7 @@ def get_senders_to_delete():
         return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting senders to delete: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to retrieve deletion recommendations'}), 500
 
 @app.route('/api/important-senders', methods=['GET'])
 def get_important_senders():
@@ -532,7 +532,7 @@ def get_important_senders():
         return jsonify(processed_senders)
     except Exception as e:
         logger.error(f"Error getting important senders: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to retrieve important senders'}), 500
 
 @app.route('/api/patterns', methods=['GET'])
 def get_patterns():
@@ -559,7 +559,7 @@ def get_patterns():
                 day = dt.strftime('%A')
                 hour_distribution[hour] = hour_distribution.get(hour, 0) + 1
                 day_distribution[day] = day_distribution.get(day, 0) + 1
-            except:
+            except (ValueError, TypeError, AttributeError):
                 continue
         
         # Generate sender patterns
@@ -591,7 +591,7 @@ def get_patterns():
         return jsonify(patterns)
     except Exception as e:
         logger.error(f"Error getting patterns: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to retrieve analysis patterns'}), 500
 
 @app.route('/api/run-analysis', methods=['POST'])
 def run_analysis():

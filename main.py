@@ -112,12 +112,16 @@ def _normalize_datetime(dt: Optional[datetime]) -> Optional[datetime]:
     """Normalize datetimes to naive UTC for consistent comparisons."""
     if not dt:
         return dt
+    # Explicit type check to ensure we have a datetime object
+    if not isinstance(dt, datetime):
+        logger.debug(f"_normalize_datetime received non-datetime type: {type(dt)}")
+        return dt
     try:
         from datetime import timezone
         if dt.tzinfo is not None:
             return dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return dt
 
 @dataclass
@@ -146,9 +150,34 @@ class Configuration:
         self.config_file = config_file
         self.load_default_config()
         if os.path.exists(config_file):
+            self._check_config_permissions(config_file)
             self.config.read(config_file)
         else:
             self.save_config()
+
+    def _check_config_permissions(self, config_file: str):
+        """Check if config file has overly permissive permissions and warn.
+        
+        Config files may contain sensitive credentials (email passwords).
+        Warn if file is world-readable or world-writable.
+        """
+        try:
+            import stat
+            file_stat = os.stat(config_file)
+            mode = file_stat.st_mode
+            
+            # Check if world-readable or world-writable
+            world_readable = bool(mode & stat.S_IROTH)
+            world_writable = bool(mode & stat.S_IWOTH)
+            
+            if world_readable or world_writable:
+                logger.warning(
+                    f"Config file {config_file} has overly permissive permissions: "
+                    f"world-readable={world_readable}, world-writable={world_writable}. "
+                    f"Consider running: chmod 600 {config_file}"
+                )
+        except (OSError, IOError) as e:
+            logger.debug(f"Could not check config file permissions: {e}")
 
     def load_default_config(self):
         """Load default configuration values"""
@@ -1185,7 +1214,8 @@ class EmailCategorizer:
                 category = self.pipeline.predict([text])[0]
                 email.category = category
                 return category
-            except:
+            except (ValueError, TypeError, AttributeError, RuntimeError):
+                # ML classification failed, fall back to keyword-based
                 pass
 
         # Fallback to keyword-based categorization
